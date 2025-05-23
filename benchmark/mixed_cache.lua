@@ -5,7 +5,6 @@ local etags = {}
      request_count = request_count + 1
      local url_path = "/index.html"
      
-     -- every 3rd request is conditional (simulating repeat visitors)
      if request_count % 3 == 0 and etags[url_path] then
        return wrk.format("GET", url_path, {["If-None-Match"] = etags[url_path]})
      else

@@ -39,12 +39,22 @@ static const struct {
 
 static char header_buffer[8192];
 
+static unsigned int hash_key(const char *key) {
+    unsigned int hash = 5381;
+    int c;
+    while ((c = *key++)) {
+        hash = ((hash << 5) + hash) + c;
+    }
+    return hash % CACHE_SIZE;
+}
+
 typedef struct {
     char path[PATH_MAX];
     char *response;
     size_t response_len;
     time_t timestamp;
-    char vary_key[256];  
+    char vary_key[256];
+    char etag[64];
 } cache_entry_t;
 
 static cache_entry_t response_cache[CACHE_SIZE];
@@ -60,19 +70,22 @@ static void generate_vary_key(const char *path, const http_request_t *request, c
     snprintf(key, key_size, "%s:", path);
     
     for (int i = 0; i < request->header_count; i++) {
-        if (strcasecmp(request->headers[i][0], "User-Agent") == 0) {
+        if (strcasecmp(request->headers[i][0], "Accept-Encoding") == 0) {
             size_t current_len = strlen(key);
-            snprintf(key + current_len, key_size - current_len, "UA:%s:", request->headers[i][1]);
+            const char *encoding = request->headers[i][1];
+            if (strstr(encoding, "gzip")) {
+                snprintf(key + current_len, key_size - current_len, "gzip");
+            } else if (strstr(encoding, "deflate")) {
+                snprintf(key + current_len, key_size - current_len, "deflate");
+            } else {
+                snprintf(key + current_len, key_size - current_len, "none");
+            }
             break;
         }
     }
     
-    for (int i = 0; i < request->header_count; i++) {
-        if (strcasecmp(request->headers[i][0], "Accept-Encoding") == 0) {
-            size_t current_len = strlen(key);
-            snprintf(key + current_len, key_size - current_len, "AE:%s", request->headers[i][1]);
-            break;
-        }
+    if (strchr(key, ':') && key[strlen(key)-1] == ':') {
+        strcat(key, "none");
     }
 }
 
@@ -80,12 +93,30 @@ static cache_entry_t *find_cached_response(const char *path, const http_request_
     char vary_key[256];
     generate_vary_key(path, request, vary_key, sizeof(vary_key));
     
+    LOG_DEBUG("Cache lookup: path='%s', vary_key='%s'", path, vary_key);
+    
+    unsigned int hash_idx = hash_key(vary_key);
+    if (response_cache[hash_idx].path[0] != '\0' && 
+        strcmp(response_cache[hash_idx].path, path) == 0 &&
+        strcmp(response_cache[hash_idx].vary_key, vary_key) == 0 &&
+        time(NULL) - response_cache[hash_idx].timestamp < CACHE_TIMEOUT) {
+        LOG_DEBUG("Cache hit (hash) for %s with vary key %s", path, vary_key);
+        return &response_cache[hash_idx];
+    }
+    
     for (int i = 0; i < CACHE_SIZE; i++) {
+        if (i == (int)hash_idx) continue;
+        
+        if (response_cache[i].path[0] != '\0') {
+            LOG_DEBUG("Cache entry %d: path='%s', vary_key='%s', age=%ld", 
+                      i, response_cache[i].path, response_cache[i].vary_key, 
+                      time(NULL) - response_cache[i].timestamp);
+        }
         if (response_cache[i].path[0] != '\0' && 
             strcmp(response_cache[i].path, path) == 0 &&
             strcmp(response_cache[i].vary_key, vary_key) == 0 &&
             time(NULL) - response_cache[i].timestamp < CACHE_TIMEOUT) {
-            LOG_DEBUG("Cache hit for %s with vary key %s", path, vary_key);
+            LOG_DEBUG("Cache hit (linear) for %s with vary key %s", path, vary_key);
             return &response_cache[i];
         }
     }
@@ -93,8 +124,18 @@ static cache_entry_t *find_cached_response(const char *path, const http_request_
     return NULL;
 }
 
-static void cache_response(const char *path, const char *response, size_t response_len, const http_request_t *request) {
-    cache_entry_t *entry = &response_cache[cache_index];
+static void cache_response(const char *path, const char *response, size_t response_len, const http_request_t *request, const char *etag) {
+    char vary_key[256];
+    generate_vary_key(path, request, vary_key, sizeof(vary_key));
+    
+    unsigned int hash_idx = hash_key(vary_key);
+    cache_entry_t *entry = &response_cache[hash_idx];
+    
+    if (entry->path[0] != '\0' && 
+        (strcmp(entry->path, path) != 0 || strcmp(entry->vary_key, vary_key) != 0)) {
+        entry = &response_cache[cache_index];
+        cache_index = (cache_index + 1) % CACHE_SIZE;
+    }
     
     if (entry->response) {
         free(entry->response);
@@ -104,7 +145,12 @@ static void cache_response(const char *path, const char *response, size_t respon
     strncpy(entry->path, path, PATH_MAX - 1);
     entry->path[PATH_MAX - 1] = '\0';
     
-    generate_vary_key(path, request, entry->vary_key, sizeof(entry->vary_key));
+    strncpy(entry->vary_key, vary_key, sizeof(entry->vary_key) - 1);
+    entry->vary_key[sizeof(entry->vary_key) - 1] = '\0';
+    strncpy(entry->etag, etag, sizeof(entry->etag) - 1);
+    entry->etag[sizeof(entry->etag) - 1] = '\0';
+    
+    LOG_DEBUG("Cache population: path='%s', vary_key='%s', etag='%s'", path, entry->vary_key, etag);
     
     entry->response = malloc(response_len);
     if (entry->response) {
@@ -115,8 +161,6 @@ static void cache_response(const char *path, const char *response, size_t respon
     } else {
         LOG_ERROR("Failed to allocate memory for cached response");
     }
-    
-    cache_index = (cache_index + 1) % CACHE_SIZE;
 }
 
 int http_parse_request(const char *buffer, size_t length, http_request_t *request) {
@@ -239,15 +283,6 @@ int http_serve_file(const char *path, http_response_t *response, const http_requ
     }
     
     LOG_DEBUG("Serving file: %s", full_path);
-    
-    cache_entry_t *cache = find_cached_response(full_path, request);
-    if (cache) {
-        LOG_DEBUG("Using cached response for %s", full_path);
-        response->is_cached = 1;
-        response->cached_response = cache->response;
-        response->body_length = cache->response_len;
-        return 0;
-    }
     
     int file_fd = open(full_path, O_RDONLY | O_NONBLOCK);
     if (file_fd == -1) {
@@ -412,7 +447,7 @@ int http_serve_file(const char *path, http_response_t *response, const http_requ
                     if (complete_response) {
                         memcpy(complete_response, header, header_len);
                         memcpy(complete_response + header_len, file_content, st.st_size);
-                        cache_response(full_path, complete_response, header_len + st.st_size, request);
+                        cache_response(full_path, complete_response, header_len + st.st_size, request, etag);
                         free(complete_response);
                     }
                 }
@@ -684,15 +719,103 @@ void http_handle_request(const http_request_t *request, http_response_t *respons
     cache_entry_t *cache = find_cached_response(file_path, request);
     if (cache) {
         LOG_DEBUG("Using cached response for %s", file_path);
+        const char *if_none = NULL;
+        for (int i = 0; i < request->header_count; i++) {
+            if (strcasecmp(request->headers[i][0], "If-None-Match") == 0) {
+                if_none = request->headers[i][1];
+                break;
+            }
+        }
+
+        if (if_none) {
+            LOG_DEBUG("Checking cached ETag: client sent '%s', cached has '%s'", if_none, cache->etag);
+            
+            char if_none_copy[1024];
+            strncpy(if_none_copy, if_none, sizeof(if_none_copy) - 1);
+            if_none_copy[sizeof(if_none_copy) - 1] = '\0';
+            
+            char *token = strtok(if_none_copy, ",");
+            int matched = 0;
+            
+            while (token && !matched) {
+                while (isspace(*token)) token++;
+                
+                if (strcmp(token, "*") == 0) {
+                    matched = 1;
+                    break;
+                }
+                
+                char clean_token[256] = {0};
+                const char *start = token;
+                if (*start == 'W' && *(start+1) == '/') {
+                    start += 2;
+                }
+                
+                if (*start == '"') {
+                    start++;
+                    const char *end = strrchr(start, '"');
+                    if (end) {
+                        size_t len = end - start;
+                        strncpy(clean_token, start, len);
+                        clean_token[len] = '\0';
+                    } else {
+                        strncpy(clean_token, start, sizeof(clean_token) - 1);
+                    }
+                } else {
+                    strncpy(clean_token, start, sizeof(clean_token) - 1);
+                }
+                
+                char *p = clean_token + strlen(clean_token) - 1;
+                while (p >= clean_token && isspace(*p)) {
+                    *p = '\0';
+                    p--;
+                }
+                
+                char cached_etag[64] = {0};
+                const char *etag_start = cache->etag;
+                if (*etag_start == '"') {
+                    etag_start++;
+                    const char *etag_end = strrchr(etag_start, '"');
+                    if (etag_end) {
+                        size_t len = etag_end - etag_start;
+                        strncpy(cached_etag, etag_start, len);
+                        cached_etag[len] = '\0';
+                    }
+                } else {
+                    strncpy(cached_etag, etag_start, sizeof(cached_etag) - 1);
+                }
+                
+                LOG_DEBUG("Comparing cleaned ETags: client '%s' vs cached '%s'", clean_token, cached_etag);
+                
+                if (strcmp(clean_token, cached_etag) == 0) {
+                    matched = 1;
+                    break;
+                }
+                
+                token = strtok(NULL, ",");
+            }
+            
+            if (matched) {
+                LOG_DEBUG("Cached ETag match found, returning 304 Not Modified");
+                response->status_code = 304;
+                response->status_text = "Not Modified";
+                response->body_length = 0;
+                response->is_cached = 0;
+                http_add_header(response, "ETag", cache->etag);
+                response->keep_alive = http_should_keep_alive(request);
+                return;
+            }
+        }
+
         response->is_cached = 1;
         response->cached_response = cache->response;
         response->body_length = cache->response_len;
         response->keep_alive = http_should_keep_alive(request);
-        
+
         if (is_head) {
             response->body_length = 0;
         }
-        
+
         return;
     }
 

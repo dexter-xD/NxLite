@@ -1,0 +1,13 @@
+Test,RPS,Transfer/sec,Avg_Latency,Max_Latency,Total_Requests,Total_Transfer
+Baseline_GET,91216.49,0.90GB,1.09ms,5.88ms,2741315,27.10GBread
+Cache_Mixed_33pct,311891.08,2.07GB,281.89us,1.48ms,9387559,62.16GBread
+Cache_Mixed_50pct,284923.12,1.42GB,261.51us,20.85ms,8575906,42.78GBread
+Cache_Heavy_80pct,272238.10,571.57MB,346.67us,21.23ms,8194181,16.80GBread
+HTML_Files,36733.00,68.77MB,2.89ms,55.04ms,1104837,2.02GBread
+Static_Assets,24182.31,2.94MB,4.28ms,69.84ms,727579,88.41MBread
+Compression_Gzip,34065.32,100.39MB,3.17ms,33.32ms,1022036,2.94GBread
+Compression_Mixed,98149.50,244.73MB,1.04ms,27.52ms,2954256,7.19GBread
+RealWorld_Burst,52212.35,92.41MB,3.96ms,44.12ms,3137417,5.42GBread
+RealWorld_Mobile,15960.90,1.31MB,1.81ms,52.62ms,479638,39.37MBread
+Stress_High_Concurrency,437344.34,2.90GB,1.85ms,56.17ms,13163828,87.16GBread
+Stress_Keep_Alive,235314.42,1.56GB,391.30us,25.95ms,7073753,46.84GBread
