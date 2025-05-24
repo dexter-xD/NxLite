@@ -32,14 +32,6 @@ A high-performance HTTP server written in C, designed for maximum efficiency, ed
 - **Adaptive Compression Levels**: Optimized settings per content type
 - **Bandwidth Optimization**: Up to 81% reduction in data transfer
 
-### HTTP Features
-- **HTTP/1.1 Compliant**: Full support for modern HTTP features
-- **Multiple Methods**: GET, HEAD, POST support
-- **Range Requests**: Partial content delivery
-- **MIME Type Detection**: Automatic content-type headers
-- **Cache-Control Headers**: Proper caching directives
-- **Last-Modified Support**: File-based modification tracking
-
 ## 📊 Benchmark Results
 
 ### Edge Caching Performance
