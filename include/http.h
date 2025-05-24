@@ -80,4 +80,6 @@ int http_compress_content(http_response_t *response, compression_type_t type, in
 compression_type_t http_negotiate_compression(const http_request_t *request);
 int http_should_compress_mime_type(const char *mime_type);
 
+void http_cache_cleanup(void);
+
 #endif 

@@ -1,4 +1,5 @@
 #include "http.h"
+#include <pthread.h>
 
 
 static const struct {
@@ -60,6 +61,9 @@ typedef struct {
 static cache_entry_t response_cache[CACHE_SIZE];
 static int cache_index = 0;
 
+
+static pthread_mutex_t cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 static void generate_vary_key(const char *path, const http_request_t *request, char *key, size_t key_size) {
     if (!request) {
         strncpy(key, path, key_size - 1);
@@ -86,7 +90,7 @@ static void generate_vary_key(const char *path, const http_request_t *request, c
     
     if (strchr(key, ':') && key[strlen(key)-1] == ':') {
         size_t current_len = strlen(key);
-        if (current_len + 4 < key_size) {  // "none" is 4 chars + null terminator
+        if (current_len + 4 < key_size) { 
             snprintf(key + current_len, key_size - current_len, "none");
         }
     }
@@ -98,13 +102,17 @@ static cache_entry_t *find_cached_response(const char *path, const http_request_
     
     LOG_DEBUG("Cache lookup: path='%s', vary_key='%s'", path, vary_key);
     
+    pthread_mutex_lock(&cache_mutex);
+    
     unsigned int hash_idx = hash_key(vary_key);
     if (response_cache[hash_idx].path[0] != '\0' && 
         strcmp(response_cache[hash_idx].path, path) == 0 &&
         strcmp(response_cache[hash_idx].vary_key, vary_key) == 0 &&
         time(NULL) - response_cache[hash_idx].timestamp < CACHE_TIMEOUT) {
         LOG_DEBUG("Cache hit (hash) for %s with vary key %s", path, vary_key);
-        return &response_cache[hash_idx];
+        cache_entry_t *result = &response_cache[hash_idx];
+        pthread_mutex_unlock(&cache_mutex);
+        return result;
     }
     
     for (int i = 0; i < CACHE_SIZE; i++) {
@@ -120,16 +128,21 @@ static cache_entry_t *find_cached_response(const char *path, const http_request_
             strcmp(response_cache[i].vary_key, vary_key) == 0 &&
             time(NULL) - response_cache[i].timestamp < CACHE_TIMEOUT) {
             LOG_DEBUG("Cache hit (linear) for %s with vary key %s", path, vary_key);
-            return &response_cache[i];
+            cache_entry_t *result = &response_cache[i];
+            pthread_mutex_unlock(&cache_mutex);
+            return result;
         }
     }
     LOG_DEBUG("Cache miss for %s with vary key %s", path, vary_key);
+    pthread_mutex_unlock(&cache_mutex);
     return NULL;
 }
 
 static void cache_response(const char *path, const char *response, size_t response_len, const http_request_t *request, const char *etag) {
     char vary_key[256];
     generate_vary_key(path, request, vary_key, sizeof(vary_key));
+    
+    pthread_mutex_lock(&cache_mutex);
     
     unsigned int hash_idx = hash_key(vary_key);
     cache_entry_t *entry = &response_cache[hash_idx];
@@ -164,6 +177,8 @@ static void cache_response(const char *path, const char *response, size_t respon
     } else {
         LOG_ERROR("Failed to allocate memory for cached response");
     }
+    
+    pthread_mutex_unlock(&cache_mutex);
 }
 
 int http_parse_request(const char *buffer, size_t length, http_request_t *request) {
@@ -1317,4 +1332,21 @@ int http_compress_content(http_response_t *response, compression_type_t type, in
     
     deflateEnd(&strm);
     return 0;
+}
+
+void http_cache_cleanup(void) {
+    pthread_mutex_lock(&cache_mutex);
+    
+    for (int i = 0; i < CACHE_SIZE; i++) {
+        if (response_cache[i].response) {
+            free(response_cache[i].response);
+            response_cache[i].response = NULL;
+        }
+        memset(&response_cache[i], 0, sizeof(cache_entry_t));
+    }
+    
+    cache_index = 0;
+    
+    pthread_mutex_unlock(&cache_mutex);
+    pthread_mutex_destroy(&cache_mutex);
 } 
