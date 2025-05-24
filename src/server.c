@@ -75,6 +75,9 @@ static int optimize_server_socket(int fd) {
 int server_init(server_t *server, int port) {
     memset(server, 0, sizeof(server_t));
     
+    server->server_fd = -1;
+    server->epoll_fd = -1;
+    
     server->server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server->server_fd == -1) {
         LOG_ERROR("Failed to create socket: %s", strerror(errno));
@@ -83,6 +86,7 @@ int server_init(server_t *server, int port) {
     
     if (optimize_server_socket(server->server_fd) == -1) {
         close(server->server_fd);
+        server->server_fd = -1;
         return -1;
     }
     
@@ -94,11 +98,13 @@ int server_init(server_t *server, int port) {
              sizeof(server->server_addr)) == -1) {
         LOG_ERROR("Failed to bind socket: %s", strerror(errno));
         close(server->server_fd);
+        server->server_fd = -1;
         return -1;
     }
     
     if (set_nonblocking(server->server_fd) == -1) {
         close(server->server_fd);
+        server->server_fd = -1;
         return -1;
     }
     
@@ -106,6 +112,7 @@ int server_init(server_t *server, int port) {
     if (server->epoll_fd == -1) {
         LOG_ERROR("Failed to create epoll instance: %s", strerror(errno));
         close(server->server_fd);
+        server->server_fd = -1;
         return -1;
     }
     
@@ -215,7 +222,21 @@ int server_run(server_t *server) {
 }
 
 void server_cleanup(server_t *server) {
-    close(server->epoll_fd);
+    if (!server) {
+        return;
+    }
+    
+    if (server->epoll_fd != -1) {
+        close(server->epoll_fd);
+        server->epoll_fd = -1;
+    }
+    
+    if (server->server_fd != -1) {
+        close(server->server_fd);
+        server->server_fd = -1;
+    }
+    
+    memset(server, 0, sizeof(server_t));
 }
 
 int server_start(server_t *server) {
@@ -228,20 +249,13 @@ int server_start(server_t *server) {
             int max_backlog = atoi(backlog_str);
             if (max_backlog > 0) {
                 backlog = max_backlog;
+                if (max_backlog < backlog) {
+                    backlog = max_backlog;
+                }
             }
         }
         fclose(fp);
-    }
-    
-    fp = fopen("/proc/sys/net/core/somaxconn", "r");
-    if (fp) {
-        if (fgets(backlog_str, sizeof(backlog_str), fp) != NULL) {
-            int max_allowed = atoi(backlog_str);
-            if (max_allowed > 0 && max_allowed < backlog) {
-                backlog = max_allowed;
-            }
-        }
-        fclose(fp);
+        fp = NULL;
     }
     
     LOG_INFO("Using listen backlog size: %d", backlog);

@@ -342,6 +342,7 @@ void http_create_response(http_response_t *response, int status_code) {
     memset(response, 0, sizeof(http_response_t));
     response->status_code = status_code;
     response->keep_alive = 0;  
+    response->file_fd = -1; 
     
     for (int i = 0; status_messages[i].code != 0; i++) {
         if (status_messages[i].code == status_code) {
@@ -769,19 +770,30 @@ int http_send_response(int client_fd, http_response_t *response) {
 }
 
 void http_free_response(http_response_t *response) {
+    if (!response) {
+        return;
+    }
+    
     if (response->is_file && response->file_fd != -1) {
         close(response->file_fd);
+        response->file_fd = -1; 
+        response->is_file = 0;
     }
     
     if (response->body) {
         free(response->body);
         response->body = NULL;
+        response->body_length = 0;
     }
     
     if (response->compressed_body) {
         free(response->compressed_body);
         response->compressed_body = NULL;
+        response->compressed_length = 0;
     }
+    
+    response->is_cached = 0;
+    response->cached_response = NULL;
 }
 
 static int validate_and_resolve_path(const char *root_dir, const char *request_path, char *resolved_path, size_t resolved_path_size) {

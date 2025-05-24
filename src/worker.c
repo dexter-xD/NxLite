@@ -69,6 +69,9 @@ static int remove_from_epoll(worker_t *worker, int fd) {
 int worker_init(worker_t *worker, int server_fd, int cpu_id) {
     memset(worker, 0, sizeof(worker_t));
     
+    worker->epoll_fd = -1;
+    worker->server_fd = server_fd;
+    
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(cpu_id, &cpuset);
@@ -93,16 +96,17 @@ int worker_init(worker_t *worker, int server_fd, int cpu_id) {
     if (set_nonblocking(server_fd) == -1) {
         mempool_cleanup(&worker->buffer_pool);
         close(worker->epoll_fd);
+        worker->epoll_fd = -1;
         return -1;
     }
     
     if (add_to_epoll(worker, server_fd, EPOLLIN | EPOLLET) == -1) {
         mempool_cleanup(&worker->buffer_pool);
         close(worker->epoll_fd);
+        worker->epoll_fd = -1;
         return -1;
     }
     
-    worker->server_fd = server_fd;
     worker->is_running = 1;
     worker->keep_alive_timeout = KEEP_ALIVE_TIMEOUT;
     
@@ -111,6 +115,7 @@ int worker_init(worker_t *worker, int server_fd, int cpu_id) {
         LOG_ERROR("Failed to allocate events array");
         mempool_cleanup(&worker->buffer_pool);
         close(worker->epoll_fd);
+        worker->epoll_fd = -1;
         return -1;
     }
     
@@ -119,8 +124,15 @@ int worker_init(worker_t *worker, int server_fd, int cpu_id) {
         LOG_ERROR("Failed to allocate clients array");
         mempool_cleanup(&worker->buffer_pool);
         free(worker->events);
+        worker->events = NULL;
         close(worker->epoll_fd);
+        worker->epoll_fd = -1;
         return -1;
+    }
+    
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        worker->clients[i].fd = -1;
+        worker->clients[i].timer_fd = -1;
     }
     
     worker->connection_pool = malloc(sizeof(int) * CONNECTION_POOL_SIZE);
@@ -128,8 +140,11 @@ int worker_init(worker_t *worker, int server_fd, int cpu_id) {
         LOG_ERROR("Failed to allocate connection pool");
         mempool_cleanup(&worker->buffer_pool);
         free(worker->events);
+        worker->events = NULL;
         free(worker->clients);
+        worker->clients = NULL;
         close(worker->epoll_fd);
+        worker->epoll_fd = -1;
         return -1;
     }
     worker->pool_size = CONNECTION_POOL_SIZE;
@@ -695,13 +710,48 @@ void worker_cleanup(worker_t *worker) {
     for (int i = 0; i < worker->client_count; i++) {
         if (worker->clients[i].buffer) {
             mempool_free(&worker->buffer_pool, worker->clients[i].buffer);
+            worker->clients[i].buffer = NULL;
         }
-        close(worker->clients[i].fd);
-        close(worker->clients[i].timer_fd);
+        
+        if (worker->clients[i].has_pending_response) {
+            http_free_response(&worker->clients[i].pending_response);
+            worker->clients[i].has_pending_response = 0;
+        }
+        
+        if (worker->clients[i].fd != -1) {
+            close(worker->clients[i].fd);
+            worker->clients[i].fd = -1;
+        }
+        
+        if (worker->clients[i].timer_fd != -1) {
+            close(worker->clients[i].timer_fd);
+            worker->clients[i].timer_fd = -1;
+        }
     }
     
-    free(worker->clients);
-    free(worker->events);
-    close(worker->epoll_fd);
+    if (worker->clients) {
+        free(worker->clients);
+        worker->clients = NULL;
+    }
+    
+    if (worker->events) {
+        free(worker->events);
+        worker->events = NULL;
+    }
+    
+    if (worker->connection_pool) {
+        free(worker->connection_pool);
+        worker->connection_pool = NULL;
+    }
+    
+    if (worker->epoll_fd != -1) {
+        close(worker->epoll_fd);
+        worker->epoll_fd = -1;
+    }
+    
     mempool_cleanup(&worker->buffer_pool);
+    worker->client_count = 0;
+    worker->is_running = 0;
+    
+    LOG_DEBUG("Worker %d cleanup completed", worker->cpu_id);
 } 

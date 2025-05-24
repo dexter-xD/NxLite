@@ -152,6 +152,7 @@ int master_init(master_t *master, int port, int worker_count) {
     master->port = port;
     master->worker_count = worker_count;
     master->is_running = 1;
+    master->server_fd = -1; 
     master_instance = master;
 
     master->server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -164,12 +165,14 @@ int master_init(master_t *master, int port, int worker_count) {
     if (setsockopt(master->server_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) == -1) {
         LOG_ERROR("Failed to set SO_REUSEPORT: %s", strerror(errno));
         close(master->server_fd);
+        master->server_fd = -1;
         return -1;
     }
 
     if (configure_tcp_socket(master->server_fd) != 0) {
         LOG_ERROR("Failed to configure TCP socket options");
         close(master->server_fd);
+        master->server_fd = -1;
         return -1;
     }
 
@@ -182,12 +185,14 @@ int master_init(master_t *master, int port, int worker_count) {
     if (bind(master->server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
         LOG_ERROR("Failed to bind to port %d: %s", port, strerror(errno));
         close(master->server_fd);
+        master->server_fd = -1;
         return -1;
     }
 
     if (listen(master->server_fd, SOMAXCONN) == -1) {
         LOG_ERROR("Failed to listen: %s", strerror(errno));
         close(master->server_fd);
+        master->server_fd = -1;
         return -1;
     }
 
@@ -195,6 +200,7 @@ int master_init(master_t *master, int port, int worker_count) {
     if (!worker_pids) {
         LOG_ERROR("Failed to allocate worker PID array");
         close(master->server_fd);
+        master->server_fd = -1;
         return -1;
     }
 
@@ -203,13 +209,17 @@ int master_init(master_t *master, int port, int worker_count) {
     sa.sa_handler = handle_child_signal;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART;
+    
     if (sigaction(SIGCHLD, &sa, NULL) == -1) {
-        LOG_ERROR("Failed to set up SIGCHLD handler: %s", strerror(errno));
-        free(worker_pids);
+        LOG_ERROR("Failed to set SIGCHLD handler: %s", strerror(errno));
         close(master->server_fd);
+        master->server_fd = -1;
+        free(worker_pids);
+        worker_pids = NULL;
         return -1;
     }
 
+    LOG_INFO("Master process initialized on port %d", port);
     return 0;
 }
 
@@ -311,8 +321,11 @@ void master_cleanup(master_t *master) {
         free(worker_pids);
         worker_pids = NULL;
     }
+    
+    http_cache_cleanup();
 
     master_instance = NULL;
+    LOG_DEBUG("Master cleanup completed");
 }
 
 void master_handle_signal(int signum) {
