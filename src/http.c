@@ -40,6 +40,21 @@ static const struct {
 
 static char header_buffer[8192];
 
+typedef struct {
+    unsigned long cache_hits;
+    unsigned long cache_misses;
+    unsigned long cache_evictions;
+    unsigned long cache_allocations;
+    unsigned long cache_frees;
+    size_t total_memory_used;
+    size_t max_memory_used;
+    time_t last_cleanup_time;
+} cache_stats_t;
+
+static cache_stats_t cache_stats = {0};
+
+static pthread_mutex_t cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 static unsigned int hash_key(const char *key) {
     unsigned int hash = 5381;
     int c;
@@ -61,8 +76,53 @@ typedef struct {
 static cache_entry_t response_cache[CACHE_SIZE];
 static int cache_index = 0;
 
+static void update_cache_stats_on_allocation(size_t size) {
+    cache_stats.cache_allocations++;
+    cache_stats.total_memory_used += size;
+    if (cache_stats.total_memory_used > cache_stats.max_memory_used) {
+        cache_stats.max_memory_used = cache_stats.total_memory_used;
+    }
+}
 
-static pthread_mutex_t cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+static void update_cache_stats_on_free(size_t size) {
+    cache_stats.cache_frees++;
+    if (cache_stats.total_memory_used >= size) {
+        cache_stats.total_memory_used -= size;
+    } else {
+        cache_stats.total_memory_used = 0;
+    }
+}
+
+static void cleanup_expired_cache_entries(void) {
+    time_t now = time(NULL);
+    int cleaned = 0;
+    
+    if (now - cache_stats.last_cleanup_time < 300) {
+        return;
+    }
+    
+    for (int i = 0; i < CACHE_SIZE; i++) {
+        if (response_cache[i].path[0] != '\0' && 
+            (now - response_cache[i].timestamp >= CACHE_TIMEOUT)) {
+            
+            if (response_cache[i].response) {
+                update_cache_stats_on_free(response_cache[i].response_len);
+                free(response_cache[i].response);
+                response_cache[i].response = NULL;
+            }
+            
+            memset(&response_cache[i], 0, sizeof(cache_entry_t));
+            cleaned++;
+            cache_stats.cache_evictions++;
+        }
+    }
+    
+    cache_stats.last_cleanup_time = now;
+    if (cleaned > 0) {
+        LOG_DEBUG("Cleaned up %d expired cache entries, total memory: %zu bytes", 
+                  cleaned, cache_stats.total_memory_used);
+    }
+}
 
 static void generate_vary_key(const char *path, const http_request_t *request, char *key, size_t key_size) {
     if (!request) {
@@ -104,6 +164,8 @@ static cache_entry_t *find_cached_response(const char *path, const http_request_
     
     pthread_mutex_lock(&cache_mutex);
     
+    cleanup_expired_cache_entries();
+    
     unsigned int hash_idx = hash_key(vary_key);
     if (response_cache[hash_idx].path[0] != '\0' && 
         strcmp(response_cache[hash_idx].path, path) == 0 &&
@@ -111,6 +173,7 @@ static cache_entry_t *find_cached_response(const char *path, const http_request_
         time(NULL) - response_cache[hash_idx].timestamp < CACHE_TIMEOUT) {
         LOG_DEBUG("Cache hit (hash) for %s with vary key %s", path, vary_key);
         cache_entry_t *result = &response_cache[hash_idx];
+        cache_stats.cache_hits++;
         pthread_mutex_unlock(&cache_mutex);
         return result;
     }
@@ -129,11 +192,13 @@ static cache_entry_t *find_cached_response(const char *path, const http_request_
             time(NULL) - response_cache[i].timestamp < CACHE_TIMEOUT) {
             LOG_DEBUG("Cache hit (linear) for %s with vary key %s", path, vary_key);
             cache_entry_t *result = &response_cache[i];
+            cache_stats.cache_hits++;
             pthread_mutex_unlock(&cache_mutex);
             return result;
         }
     }
     LOG_DEBUG("Cache miss for %s with vary key %s", path, vary_key);
+    cache_stats.cache_misses++;
     pthread_mutex_unlock(&cache_mutex);
     return NULL;
 }
@@ -142,7 +207,26 @@ static void cache_response(const char *path, const char *response, size_t respon
     char vary_key[256];
     generate_vary_key(path, request, vary_key, sizeof(vary_key));
     
+    const size_t MAX_CACHE_ENTRY_SIZE = 5 * 1024 * 1024;
+    if (response_len > MAX_CACHE_ENTRY_SIZE) {
+        LOG_DEBUG("Response too large to cache: %zu bytes (max: %zu)", response_len, MAX_CACHE_ENTRY_SIZE);
+        return;
+    }
+    
     pthread_mutex_lock(&cache_mutex);
+    
+    const size_t MAX_TOTAL_CACHE_MEMORY = 100 * 1024 * 1024; // 100MB total cache limit
+    if (cache_stats.total_memory_used + response_len > MAX_TOTAL_CACHE_MEMORY) {
+        LOG_DEBUG("Cache memory limit reached (%zu + %zu > %zu), triggering cleanup", 
+                  cache_stats.total_memory_used, response_len, MAX_TOTAL_CACHE_MEMORY);
+        cleanup_expired_cache_entries();
+        
+        if (cache_stats.total_memory_used + response_len > MAX_TOTAL_CACHE_MEMORY) {
+            LOG_WARN("Cache memory limit exceeded even after cleanup, skipping cache for this response");
+            pthread_mutex_unlock(&cache_mutex);
+            return;
+        }
+    }
     
     unsigned int hash_idx = hash_key(vary_key);
     cache_entry_t *entry = &response_cache[hash_idx];
@@ -154,9 +238,12 @@ static void cache_response(const char *path, const char *response, size_t respon
     }
     
     if (entry->response) {
+        update_cache_stats_on_free(entry->response_len);
         free(entry->response);
         entry->response = NULL;
     }
+    
+    memset(entry, 0, sizeof(cache_entry_t));
     
     strncpy(entry->path, path, PATH_MAX - 1);
     entry->path[PATH_MAX - 1] = '\0';
@@ -173,9 +260,12 @@ static void cache_response(const char *path, const char *response, size_t respon
         memcpy(entry->response, response, response_len);
         entry->response_len = response_len;
         entry->timestamp = time(NULL);
-        LOG_DEBUG("Cached response for %s with vary key %s", path, entry->vary_key);
+        update_cache_stats_on_allocation(response_len);
+        LOG_DEBUG("Cached response for %s with vary key %s (%zu bytes, total cache memory: %zu bytes)", 
+                  path, entry->vary_key, response_len, cache_stats.total_memory_used);
     } else {
-        LOG_ERROR("Failed to allocate memory for cached response");
+        LOG_ERROR("Failed to allocate memory for cached response (%zu bytes)", response_len);
+        memset(entry, 0, sizeof(cache_entry_t));
     }
     
     pthread_mutex_unlock(&cache_mutex);
@@ -1339,6 +1429,7 @@ void http_cache_cleanup(void) {
     
     for (int i = 0; i < CACHE_SIZE; i++) {
         if (response_cache[i].response) {
+            update_cache_stats_on_free(response_cache[i].response_len);
             free(response_cache[i].response);
             response_cache[i].response = NULL;
         }
@@ -1347,6 +1438,26 @@ void http_cache_cleanup(void) {
     
     cache_index = 0;
     
+    LOG_INFO("Cache cleanup completed. Final stats - Hits: %lu, Misses: %lu, Evictions: %lu, "
+             "Allocations: %lu, Frees: %lu, Max Memory: %zu bytes", 
+             cache_stats.cache_hits, cache_stats.cache_misses, cache_stats.cache_evictions,
+             cache_stats.cache_allocations, cache_stats.cache_frees, cache_stats.max_memory_used);
+    
+    memset(&cache_stats, 0, sizeof(cache_stats_t));
+    
     pthread_mutex_unlock(&cache_mutex);
     pthread_mutex_destroy(&cache_mutex);
+}
+
+void http_get_cache_stats(unsigned long *hits, unsigned long *misses, unsigned long *evictions, 
+                         size_t *memory_used, size_t *max_memory_used) {
+    pthread_mutex_lock(&cache_mutex);
+    
+    if (hits) *hits = cache_stats.cache_hits;
+    if (misses) *misses = cache_stats.cache_misses;
+    if (evictions) *evictions = cache_stats.cache_evictions;
+    if (memory_used) *memory_used = cache_stats.total_memory_used;
+    if (max_memory_used) *max_memory_used = cache_stats.max_memory_used;
+    
+    pthread_mutex_unlock(&cache_mutex);
 } 

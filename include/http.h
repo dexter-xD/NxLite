@@ -81,5 +81,7 @@ compression_type_t http_negotiate_compression(const http_request_t *request);
 int http_should_compress_mime_type(const char *mime_type);
 
 void http_cache_cleanup(void);
+void http_get_cache_stats(unsigned long *hits, unsigned long *misses, unsigned long *evictions, 
+                         size_t *memory_used, size_t *max_memory_used);
 
 #endif 
