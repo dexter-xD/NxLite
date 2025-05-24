@@ -85,7 +85,10 @@ static void generate_vary_key(const char *path, const http_request_t *request, c
     }
     
     if (strchr(key, ':') && key[strlen(key)-1] == ':') {
-        strcat(key, "none");
+        size_t current_len = strlen(key);
+        if (current_len + 4 < key_size) {  // "none" is 4 chars + null terminator
+            snprintf(key + current_len, key_size - current_len, "none");
+        }
     }
 }
 
@@ -676,6 +679,100 @@ void http_free_response(http_response_t *response) {
     }
 }
 
+static int validate_and_resolve_path(const char *root_dir, const char *request_path, char *resolved_path, size_t resolved_path_size) {
+    if (strstr(request_path, "..") != NULL) {
+        LOG_WARN("Path traversal attempt detected: %s", request_path);
+        return -1;
+    }
+        
+    
+    if (strlen(request_path) != strcspn(request_path, "\0")) {
+        LOG_WARN("Null byte in path: %s", request_path);
+        return -1;
+    }
+    
+    char temp_path[PATH_MAX];
+    int written = snprintf(temp_path, sizeof(temp_path), "%s%s", root_dir, request_path);
+    if (written < 0 || (size_t)written >= sizeof(temp_path)) {
+        LOG_ERROR("Path too long: %s%s", root_dir, request_path);
+        return -1;
+    }
+    
+    char canonical_path[PATH_MAX];
+    if (realpath(temp_path, canonical_path) == NULL) {
+        char temp_dir[PATH_MAX];
+        strncpy(temp_dir, temp_path, sizeof(temp_dir) - 1);
+        temp_dir[sizeof(temp_dir) - 1] = '\0';
+        
+        char *last_slash = strrchr(temp_dir, '/');
+        if (last_slash != NULL) {
+            *last_slash = '\0';
+            
+            char canonical_dir[PATH_MAX];
+            if (realpath(temp_dir, canonical_dir) == NULL) {
+                return -1;
+            }
+            
+            char canonical_root[PATH_MAX];
+            if (realpath(root_dir, canonical_root) == NULL) {
+                LOG_ERROR("Cannot resolve root directory: %s", root_dir);
+                return -1;
+            }
+            
+            size_t root_len = strlen(canonical_root);
+            if (strncmp(canonical_dir, canonical_root, root_len) != 0 ||
+                (canonical_dir[root_len] != '\0' && canonical_dir[root_len] != '/')) {
+                LOG_WARN("Path traversal attempt - parent directory outside root: %s", canonical_dir);
+                return -1;
+            }
+            
+            size_t dir_len = strlen(canonical_dir);
+            size_t file_len = strlen(last_slash + 1);
+            if (dir_len + 1 + file_len >= sizeof(canonical_path)) {
+                LOG_ERROR("Reconstructed path too long");
+                return -1;
+            }
+            strncpy(canonical_path, canonical_dir, sizeof(canonical_path) - 1);
+            canonical_path[sizeof(canonical_path) - 1] = '\0';
+            strncat(canonical_path, "/", sizeof(canonical_path) - strlen(canonical_path) - 1);
+            strncat(canonical_path, last_slash + 1, sizeof(canonical_path) - strlen(canonical_path) - 1);
+        } else {
+            char canonical_root[PATH_MAX];
+            if (realpath(root_dir, canonical_root) == NULL) {
+                LOG_ERROR("Cannot resolve root directory: %s", root_dir);
+                return -1;
+            }
+            strncpy(canonical_path, temp_path, sizeof(canonical_path) - 1);
+            canonical_path[sizeof(canonical_path) - 1] = '\0';
+        }
+    }
+    
+    char canonical_root[PATH_MAX];
+    if (realpath(root_dir, canonical_root) == NULL) {
+        LOG_ERROR("Cannot resolve root directory: %s", root_dir);
+        return -1;
+    }
+    
+    size_t root_len = strlen(canonical_root);
+    if (strncmp(canonical_path, canonical_root, root_len) != 0 ||
+        (canonical_path[root_len] != '\0' && canonical_path[root_len] != '/')) {
+        LOG_WARN("Path traversal attempt detected: %s resolves to %s, outside of root %s", 
+                 request_path, canonical_path, canonical_root);
+        return -1;
+    }
+    
+    if (strlen(canonical_path) >= resolved_path_size) {
+        LOG_ERROR("Resolved path too long: %s", canonical_path);
+        return -1;
+    }
+    
+    strncpy(resolved_path, canonical_path, resolved_path_size - 1);
+    resolved_path[resolved_path_size - 1] = '\0';
+    
+    LOG_DEBUG("Path validated: %s -> %s", request_path, resolved_path);
+    return 0;
+}
+
 void http_handle_request(const http_request_t *request, http_response_t *response) {
     http_create_response(response, 200);
 
@@ -696,23 +793,11 @@ void http_handle_request(const http_request_t *request, http_response_t *respons
     char file_path[PATH_MAX];
     const char *request_path = strcmp(request->uri, "/") == 0 ? "/index.html" : request->uri;
 
-    size_t root_len = strlen(config->root_dir);
-    size_t path_len = strlen(request_path);
-
-    if (root_len + path_len >= sizeof(file_path)) {
-        LOG_ERROR("Path too long: %s%s", config->root_dir, request_path);
-        response->status_code = 414;  
-        response->status_text = "Request-URI Too Long";
-        response->keep_alive = 0;  
-        return;
-    }
-
-    int written = snprintf(file_path, sizeof(file_path), "%s%s", config->root_dir, request_path);
-    if (written < 0 || (size_t)written >= sizeof(file_path)) {
-        LOG_ERROR("Path truncation occurred: %s%s", config->root_dir, request_path);
-        response->status_code = 414;  
-        response->status_text = "Request-URI Too Long";
-        response->keep_alive = 0;  
+    if (validate_and_resolve_path(config->root_dir, request_path, file_path, sizeof(file_path)) != 0) {
+        LOG_WARN("Invalid or unsafe path requested: %s", request_path);
+        response->status_code = 403;
+        response->status_text = "Forbidden";
+        response->keep_alive = 0;
         return;
     }
     
