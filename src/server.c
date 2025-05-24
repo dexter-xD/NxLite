@@ -73,6 +73,20 @@ static int optimize_server_socket(int fd) {
 }
 
 int server_init(server_t *server, int port) {
+    if (!server) {
+        LOG_ERROR("NULL server pointer in server_init");
+        return -1;
+    }
+    
+    if (port <= 0 || port > 65535) {
+        LOG_ERROR("Invalid port number: %d (must be 1-65535)", port);
+        return -1;
+    }
+    
+    if (port < 1024) {
+        LOG_WARN("Using privileged port %d (requires root privileges)", port);
+    }
+    
     memset(server, 0, sizeof(server_t));
     
     server->server_fd = -1;
@@ -84,19 +98,24 @@ int server_init(server_t *server, int port) {
         return -1;
     }
     
+    if (server->server_fd >= FD_SETSIZE) {
+        LOG_WARN("Server socket FD %d is larger than FD_SETSIZE %d", server->server_fd, FD_SETSIZE);
+    }
+    
     if (optimize_server_socket(server->server_fd) == -1) {
         close(server->server_fd);
         server->server_fd = -1;
         return -1;
     }
     
+    memset(&server->server_addr, 0, sizeof(server->server_addr));
     server->server_addr.sin_family = AF_INET;
     server->server_addr.sin_addr.s_addr = INADDR_ANY;
-    server->server_addr.sin_port = htons(port);
+    server->server_addr.sin_port = htons((uint16_t)port);
     
     if (bind(server->server_fd, (struct sockaddr *)&server->server_addr, 
              sizeof(server->server_addr)) == -1) {
-        LOG_ERROR("Failed to bind socket: %s", strerror(errno));
+        LOG_ERROR("Failed to bind socket to port %d: %s", port, strerror(errno));
         close(server->server_fd);
         server->server_fd = -1;
         return -1;
@@ -119,22 +138,33 @@ int server_init(server_t *server, int port) {
     server->is_running = 1;
     server->is_worker = 0;
     
+    LOG_INFO("Server initialized successfully on port %d", port);
     return 0;
 }
 
 int server_init_worker(server_t *server, int server_fd) {
+    if (!server) {
+        LOG_ERROR("NULL server pointer in server_init_worker");
+        return -1;
+    }
+    
+    if (server_fd < 0) {
+        LOG_ERROR("Invalid server file descriptor: %d", server_fd);
+        return -1;
+    }
+    
     memset(server, 0, sizeof(server_t));
     server->is_worker = 1;
     server->server_fd = server_fd;
 
     if (set_nonblocking(server->server_fd) == -1) {
-        perror("set_nonblocking");
+        LOG_ERROR("Failed to set non-blocking mode for worker");
         return -1;
     }
 
     server->epoll_fd = epoll_create1(0);
     if (server->epoll_fd == -1) {
-        perror("epoll_create1");
+        LOG_ERROR("Failed to create epoll instance for worker: %s", strerror(errno));
         return -1;
     }
 
@@ -142,21 +172,50 @@ int server_init_worker(server_t *server, int server_fd) {
     ev.events = EPOLLIN | EPOLLET;
     ev.data.fd = server->server_fd;
     if (epoll_ctl(server->epoll_fd, EPOLL_CTL_ADD, server->server_fd, &ev) == -1) {
-        perror("epoll_ctl");
+        LOG_ERROR("Failed to add server socket to epoll: %s", strerror(errno));
+        close(server->epoll_fd);
+        server->epoll_fd = -1;
         return -1;
     }
 
+    LOG_DEBUG("Worker server initialized with fd=%d", server_fd);
     return 0;
 }
 
 void handle_new_connection(server_t *server) {
+    if (!server || server->server_fd < 0) {
+        LOG_ERROR("Invalid server state in handle_new_connection");
+        return;
+    }
+    
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
     int client_fd;
+    int connections_accepted = 0;
+    const int max_accepts_per_call = 100;  
 
-    while ((client_fd = accept(server->server_fd, (struct sockaddr*)&client_addr, &client_len)) != -1) {
+    while (connections_accepted < max_accepts_per_call && 
+           (client_fd = accept(server->server_fd, (struct sockaddr*)&client_addr, &client_len)) != -1) {
+        
+        if (client_fd < 0) {
+            LOG_ERROR("Invalid client file descriptor: %d", client_fd);
+            continue;
+        }
+        
+        if (client_fd >= FD_SETSIZE) {
+            LOG_WARN("Client FD %d exceeds FD_SETSIZE, closing connection", client_fd);
+            close(client_fd);
+            continue;
+        }
+        
+        char client_ip[INET_ADDRSTRLEN];
+        if (inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip))) {
+            LOG_DEBUG("Accepted connection from %s:%d (fd=%d)", 
+                     client_ip, ntohs(client_addr.sin_port), client_fd);
+        }
+        
         if (set_nonblocking(client_fd) == -1) {
-            perror("set_nonblocking");
+            LOG_ERROR("Failed to set non-blocking mode for client %d", client_fd);
             close(client_fd);
             continue;
         }
@@ -165,14 +224,20 @@ void handle_new_connection(server_t *server) {
         ev.events = EPOLLIN | EPOLLET;
         ev.data.fd = client_fd;
         if (epoll_ctl(server->epoll_fd, EPOLL_CTL_ADD, client_fd, &ev) == -1) {
-            perror("epoll_ctl");
+            LOG_ERROR("Failed to add client %d to epoll: %s", client_fd, strerror(errno));
             close(client_fd);
             continue;
         }
+        
+        connections_accepted++;
     }
 
     if (errno != EAGAIN && errno != EWOULDBLOCK) {
-        perror("accept");
+        LOG_ERROR("Accept error: %s", strerror(errno));
+    }
+    
+    if (connections_accepted > 0) {
+        LOG_DEBUG("Accepted %d new connections", connections_accepted);
     }
 }
 

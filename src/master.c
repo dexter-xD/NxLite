@@ -117,6 +117,21 @@ static int set_worker_cpu_affinity(int worker_id) {
 }
 
 static pid_t fork_worker(master_t *master, int worker_id) {
+    if (!master) {
+        LOG_ERROR("NULL master pointer in fork_worker");
+        return -1;
+    }
+    
+    if (worker_id < 0 || worker_id >= master->worker_count) {
+        LOG_ERROR("Invalid worker ID: %d (max: %d)", worker_id, master->worker_count - 1);
+        return -1;
+    }
+    
+    if (master->server_fd < 0) {
+        LOG_ERROR("Invalid server socket in fork_worker");
+        return -1;
+    }
+    
     pid_t pid = fork();
     
     if (pid == -1) {
@@ -131,21 +146,44 @@ static pid_t fork_worker(master_t *master, int worker_id) {
         }
         
         worker_t worker;
+        memset(&worker, 0, sizeof(worker));
+        
         if (worker_init(&worker, master->server_fd, cpu_id) == 0) {
             worker_run(&worker);
             worker_cleanup(&worker);
+        } else {
+            LOG_ERROR("Worker %d initialization failed", worker_id);
         }
         
         LOG_INFO("Worker %d exiting", worker_id);
         exit(0);
     }
     
+    if (pid > 0) {
+        LOG_DEBUG("Forked worker %d with PID %d", worker_id, pid);
+    }
+    
     return pid;
 }
 
 int master_init(master_t *master, int port, int worker_count) {
-    if (!master || worker_count <= 0) {
+    if (!master) {
+        LOG_ERROR("NULL master pointer in master_init");
         return -1;
+    }
+    
+    if (port <= 0 || port > 65535) {
+        LOG_ERROR("Invalid port number: %d (must be 1-65535)", port);
+        return -1;
+    }
+    
+    if (worker_count <= 0 || worker_count > 1000) {
+        LOG_ERROR("Invalid worker count: %d (must be 1-1000)", worker_count);
+        return -1;
+    }
+    
+    if (port < 1024) {
+        LOG_WARN("Using privileged port %d (requires root privileges)", port);
     }
 
     memset(master, 0, sizeof(master_t));
@@ -159,6 +197,10 @@ int master_init(master_t *master, int port, int worker_count) {
     if (master->server_fd == -1) {
         LOG_ERROR("Failed to create server socket: %s", strerror(errno));
         return -1;
+    }
+    
+    if (master->server_fd >= FD_SETSIZE) {
+        LOG_WARN("Master socket FD %d is larger than FD_SETSIZE %d", master->server_fd, FD_SETSIZE);
     }
 
     int opt = 1;
@@ -180,7 +222,7 @@ int master_init(master_t *master, int port, int worker_count) {
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(port);
+    server_addr.sin_port = htons((uint16_t)port);
 
     if (bind(master->server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
         LOG_ERROR("Failed to bind to port %d: %s", port, strerror(errno));
@@ -219,12 +261,18 @@ int master_init(master_t *master, int port, int worker_count) {
         return -1;
     }
 
-    LOG_INFO("Master process initialized on port %d", port);
+    LOG_INFO("Master process initialized on port %d with %d workers", port, worker_count);
     return 0;
 }
 
 void master_run(master_t *master) {
     if (!master) {
+        LOG_ERROR("NULL master pointer in master_run");
+        return;
+    }
+    
+    if (master->worker_count <= 0 || !worker_pids) {
+        LOG_ERROR("Invalid master state for running");
         return;
     }
 
@@ -235,16 +283,34 @@ void master_run(master_t *master) {
         if (pid > 0) {
             worker_pids[i] = pid;
             LOG_INFO("Started worker %d with PID %d", i, pid);
+        } else {
+            LOG_ERROR("Failed to start worker %d", i);
         }
     }
 
-    nice(5); 
+    if (nice(5) == -1) {
+        LOG_WARN("Failed to set nice value: %s", strerror(errno));
+    }
     
     time_t last_stats_time = time(NULL);
     int stats_interval = 60; 
+    int health_check_failures = 0;
+    const int max_health_check_failures = 5;
     
     while (master->is_running && !shutdown_requested) {
         sleep(1);
+        
+        int active_workers = 0;
+        for (int i = 0; i < master->worker_count; i++) {
+            if (worker_pids[i] > 0) {
+                if (kill(worker_pids[i], 0) == 0) {
+                    active_workers++;
+                } else {
+                    LOG_WARN("Worker %d (PID %d) health check failed: %s", i, worker_pids[i], strerror(errno));
+                    worker_pids[i] = 0;
+                }
+            }
+        }
         
         for (int i = 0; i < master->worker_count; i++) {
             if (worker_pids[i] <= 0) {
@@ -253,13 +319,23 @@ void master_run(master_t *master) {
                 if (pid > 0) {
                     worker_pids[i] = pid;
                     LOG_INFO("Restarted worker %d with PID %d", i, pid);
+                    health_check_failures = 0;
+                } else {
+                    health_check_failures++;
+                    LOG_ERROR("Failed to restart worker %d (failure count: %d)", i, health_check_failures);
+                    
+                    if (health_check_failures >= max_health_check_failures) {
+                        LOG_FATAL("Too many worker restart failures, shutting down master");
+                        master->is_running = 0;
+                        break;
+                    }
                 }
             }
         }
         
         time_t now = time(NULL);
         if (now - last_stats_time >= stats_interval) {
-            LOG_INFO("Master process running with %d workers", master->worker_count);
+            LOG_INFO("Master process running with %d/%d active workers", active_workers, master->worker_count);
             last_stats_time = now;
         }
     }
@@ -267,7 +343,9 @@ void master_run(master_t *master) {
     LOG_INFO("Master shutting down, sending SIGTERM to workers");
     for (int i = 0; i < master->worker_count; i++) {
         if (worker_pids[i] > 0) {
-            kill(worker_pids[i], SIGTERM);
+            if (kill(worker_pids[i], SIGTERM) == -1) {
+                LOG_WARN("Failed to send SIGTERM to worker %d (PID %d): %s", i, worker_pids[i], strerror(errno));
+            }
         }
     }
 
@@ -299,8 +377,11 @@ void master_run(master_t *master) {
         if (worker_pids[i] > 0) {
             LOG_WARN("Worker %d (PID %d) did not exit gracefully, sending SIGKILL", 
                     i, worker_pids[i]);
-            kill(worker_pids[i], SIGKILL);
-            waitpid(worker_pids[i], NULL, 0);
+            if (kill(worker_pids[i], SIGKILL) == -1) {
+                LOG_ERROR("Failed to send SIGKILL to worker %d: %s", i, strerror(errno));
+            } else {
+                waitpid(worker_pids[i], NULL, 0);
+            }
         }
     }
 

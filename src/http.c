@@ -271,50 +271,258 @@ static void cache_response(const char *path, const char *response, size_t respon
     pthread_mutex_unlock(&cache_mutex);
 }
 
+static int is_valid_http_method(const char *method) {
+    if (!method || strlen(method) == 0 || strlen(method) >= MAX_METHOD_SIZE) {
+        return 0;
+    }
+    
+    static const char *valid_methods[] = {
+        "GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "TRACE", "CONNECT", NULL
+    };
+    
+    for (int i = 0; valid_methods[i] != NULL; i++) {
+        if (strcmp(method, valid_methods[i]) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int is_valid_http_version(const char *version) {
+    if (!version || strlen(version) == 0) {
+        return 0;
+    }
+    
+    return (strcmp(version, "HTTP/1.0") == 0 || 
+            strcmp(version, "HTTP/1.1") == 0 || 
+            strcmp(version, "HTTP/2") == 0);
+}
+
+static int is_valid_uri(const char *uri) {
+    if (!uri || strlen(uri) == 0 || strlen(uri) >= MAX_URI_SIZE) {
+        return 0;
+    }
+    
+    if (uri[0] != '/') {
+        return 0;
+    }
+    
+    for (const char *p = uri; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        
+        if (c == '\0' || c == '\r' || c == '\n') {
+            return 0;
+        }
+        
+        if (c < 32 || c == 127) {
+            return 0;
+        }
+        
+        if (c == '<' || c == '>' || c == '"' || c == '{' || c == '}' || c == '|' || c == '\\' || c == '^' || c == '`') {
+            return 0;
+        }
+    }
+    
+    return 1;
+}
+
+static int is_valid_header_name(const char *name) {
+    if (!name || strlen(name) == 0 || strlen(name) >= MAX_HEADER_SIZE) {
+        return 0;
+    }
+    
+    for (const char *p = name; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        
+        if (c <= 32 || c >= 127) {
+            return 0;
+        }
+        
+        if (strchr("()<>@,;:\\\"/[]?={} \t", c)) {
+            return 0;
+        }
+    }
+    
+    return 1;
+}
+
+static int is_valid_header_value(const char *value) {
+    if (!value || strlen(value) >= MAX_HEADER_SIZE) {
+        return 0;
+    }
+    
+    for (const char *p = value; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        
+        if (c == '\0' || c == '\r' || c == '\n') {
+            return 0;
+        }
+        
+        if (c < 32 && c != '\t') {
+            return 0;
+        }
+    }
+    
+    return 1;
+}
+
+static size_t sanitize_input_buffer(char *buffer, size_t length) {
+    if (!buffer || length == 0) {
+        return 0;
+    }
+    
+    size_t write_pos = 0;
+    for (size_t i = 0; i < length; i++) {
+        unsigned char c = (unsigned char)buffer[i];
+        
+        if (c == '\0') {
+            break;
+        }
+        
+        if (c >= 32 || c == '\t' || c == '\r' || c == '\n') {
+            buffer[write_pos++] = buffer[i];
+        }
+    }
+    
+    buffer[write_pos] = '\0';
+    return write_pos;
+}
+
 int http_parse_request(const char *buffer, size_t length, http_request_t *request) {
-    char *line_start = (char *)buffer;
+    if (!buffer || !request || length == 0 || length > 1024 * 1024) {
+        LOG_WARN("Invalid parameters for HTTP request parsing");
+        return -1;
+    }
+    
+    memset(request, 0, sizeof(http_request_t));
+    
+    char *sanitized_buffer = malloc(length + 1);
+    if (!sanitized_buffer) {
+        LOG_ERROR("Failed to allocate memory for request sanitization");
+        return -1;
+    }
+    
+    memcpy(sanitized_buffer, buffer, length);
+    sanitized_buffer[length] = '\0';
+    
+    size_t sanitized_length = sanitize_input_buffer(sanitized_buffer, length);
+    if (sanitized_length == 0) {
+        LOG_WARN("Request buffer sanitization resulted in empty buffer");
+        free(sanitized_buffer);
+        return -1;
+    }
+    
+    char *line_start = sanitized_buffer;
     char *line_end;
     
     request->keep_alive = 0;
     
     line_end = strstr(line_start, "\r\n");
-    if (!line_end) return -1;
+    if (!line_end || line_end - line_start > 8192) {
+        LOG_WARN("Invalid or oversized request line");
+        free(sanitized_buffer);
+        return -1;
+    }
     
-    char method[16], uri[2048], version[16];
+    char method[MAX_METHOD_SIZE], uri[MAX_URI_SIZE], version[16];
+    memset(method, 0, sizeof(method));
+    memset(uri, 0, sizeof(uri));
+    memset(version, 0, sizeof(version));
+    
     if (sscanf(line_start, "%15s %2047s %15s", method, uri, version) != 3) {
+        LOG_WARN("Failed to parse HTTP request line");
+        free(sanitized_buffer);
+        return -1;
+    }
+    
+    if (!is_valid_http_method(method)) {
+        LOG_WARN("Invalid HTTP method: %s", method);
+        free(sanitized_buffer);
+        return -1;
+    }
+    
+    if (!is_valid_uri(uri)) {
+        LOG_WARN("Invalid URI: %s", uri);
+        free(sanitized_buffer);
+        return -1;
+    }
+    
+    if (!is_valid_http_version(version)) {
+        LOG_WARN("Invalid HTTP version: %s", version);
+        free(sanitized_buffer);
         return -1;
     }
     
     strncpy(request->method, method, sizeof(request->method) - 1);
+    request->method[sizeof(request->method) - 1] = '\0';
+    
     strncpy(request->uri, uri, sizeof(request->uri) - 1);
+    request->uri[sizeof(request->uri) - 1] = '\0';
+    
     strncpy(request->version, version, sizeof(request->version) - 1);
+    request->version[sizeof(request->version) - 1] = '\0';
     
     line_start = line_end + 2;
     request->header_count = 0;
     
-    while (line_start < (char *)buffer + length && request->header_count < MAX_HEADERS) {
+    while (line_start < sanitized_buffer + sanitized_length && request->header_count < MAX_HEADERS) {
         line_end = strstr(line_start, "\r\n");
         if (!line_end) break;
         
         if (line_end == line_start) break;
         
+        if (line_end - line_start > MAX_HEADER_SIZE * 2) {
+            LOG_WARN("Header line too long");
+            free(sanitized_buffer);
+            return -1;
+        }
+        
         char *colon = strchr(line_start, ':');
         if (colon) {
             *colon = '\0';
             char *value = colon + 1;
-            while (*value == ' ') value++;
+            while (*value == ' ' || *value == '\t') value++;
+            
+            char *value_end = line_end - 1;
+            while (value_end > value && (*value_end == ' ' || *value_end == '\t')) {
+                *value_end = '\0';
+                value_end--;
+            }
+            
+            if (!is_valid_header_name(line_start)) {
+                LOG_DEBUG("Questionable header name: %s", line_start);
+                *colon = ':';  
+                line_start = line_end + 2;
+                continue;
+            }
+            
+            if (!is_valid_header_value(value)) {
+                LOG_DEBUG("Questionable header value for %s", line_start);
+                *colon = ':';  
+                line_start = line_end + 2;
+                continue;
+            }
             
             strncpy(request->headers[request->header_count][0], line_start, MAX_HEADER_SIZE - 1);
+            request->headers[request->header_count][0][MAX_HEADER_SIZE - 1] = '\0';
+            
             strncpy(request->headers[request->header_count][1], value, MAX_HEADER_SIZE - 1);
+            request->headers[request->header_count][1][MAX_HEADER_SIZE - 1] = '\0';
             
             if (strcasecmp(line_start, "Connection") == 0) {
                 LOG_DEBUG("Found Connection header: %s", value);
             }
             
             request->header_count++;
+        } else {
+            LOG_WARN("Malformed header line (no colon)");
         }
         
         line_start = line_end + 2;
+    }
+    
+    if (request->header_count >= MAX_HEADERS) {
+        LOG_WARN("Too many headers in request (max: %d)", MAX_HEADERS);
     }
     
     request->keep_alive = (strcmp(request->version, "HTTP/1.1") == 0);
@@ -335,10 +543,64 @@ int http_parse_request(const char *buffer, size_t length, http_request_t *reques
     LOG_DEBUG("Request parsed: %s %s %s, keep-alive=%d", 
               request->method, request->uri, request->version, request->keep_alive);
     
+    free(sanitized_buffer);
     return 0;
 }
 
+int http_validate_request(const http_request_t *request) {
+    if (!request) {
+        return 0;
+    }
+    
+    if (strlen(request->method) == 0 || strlen(request->method) >= MAX_METHOD_SIZE) {
+        return 0;
+    }
+    
+    if (strlen(request->uri) == 0 || strlen(request->uri) >= MAX_URI_SIZE) {
+        return 0;
+    }
+    
+    if (strlen(request->version) == 0 || strlen(request->version) >= 16) {
+        return 0;
+    }
+    
+    if (request->header_count < 0 || request->header_count > MAX_HEADERS) {
+        return 0;
+    }
+    
+    for (int i = 0; i < request->header_count; i++) {
+        if (!http_validate_header_name(request->headers[i][0]) ||
+            !http_validate_header_value(request->headers[i][1])) {
+            return 0;
+        }
+    }
+    
+    return 1;
+}
+
+int http_validate_status_code(int status_code) {
+    return (status_code >= 100 && status_code <= 599);
+}
+
+int http_validate_header_name(const char *name) {
+    return is_valid_header_name(name);
+}
+
+int http_validate_header_value(const char *value) {
+    return is_valid_header_value(value);
+}
+
 void http_create_response(http_response_t *response, int status_code) {
+    if (!response) {
+        LOG_ERROR("NULL response pointer in http_create_response");
+        return;
+    }
+    
+    if (!http_validate_status_code(status_code)) {
+        LOG_WARN("Invalid status code %d, using 500", status_code);
+        status_code = 500;
+    }
+    
     memset(response, 0, sizeof(http_response_t));
     response->status_code = status_code;
     response->keep_alive = 0;  
@@ -351,6 +613,11 @@ void http_create_response(http_response_t *response, int status_code) {
         }
     }
     
+    if (!response->status_text) {
+        response->status_text = "Unknown Status";
+        LOG_WARN("No status text found for code %d", status_code);
+    }
+    
     response->compression_type = COMPRESSION_NONE;
     response->compressed_body = NULL;
     response->compressed_length = 0;
@@ -360,16 +627,58 @@ void http_create_response(http_response_t *response, int status_code) {
 }
 
 void http_add_header(http_response_t *response, const char *name, const char *value) {
-    if (response->header_count < MAX_HEADERS) {
-        strncpy(response->headers[response->header_count][0], name, MAX_HEADER_SIZE - 1);
-        strncpy(response->headers[response->header_count][1], value, MAX_HEADER_SIZE - 1);
-        response->header_count++;
+    if (!response) {
+        LOG_ERROR("NULL response pointer in http_add_header");
+        return;
     }
+    
+    if (!name || !value) {
+        LOG_WARN("NULL header name or value in http_add_header");
+        return;
+    }
+    
+    if (!http_validate_header_name(name)) {
+        LOG_WARN("Invalid header name: %s", name);
+        return;
+    }
+    
+    if (!http_validate_header_value(value)) {
+        LOG_WARN("Invalid header value for %s", name);
+        return;
+    }
+    
+    if (response->header_count >= MAX_HEADERS) {
+        LOG_WARN("Cannot add header %s: %s - maximum headers reached (%d)", name, value, MAX_HEADERS);
+        return;
+    }
+    
+    strncpy(response->headers[response->header_count][0], name, MAX_HEADER_SIZE - 1);
+    response->headers[response->header_count][0][MAX_HEADER_SIZE - 1] = '\0';
+    
+    strncpy(response->headers[response->header_count][1], value, MAX_HEADER_SIZE - 1);
+    response->headers[response->header_count][1][MAX_HEADER_SIZE - 1] = '\0';
+    
+    response->header_count++;
+    
+    LOG_DEBUG("Added header: %s: %s", name, value);
 }
 
 const char *http_get_mime_type(const char *path) {
+    if (!path || strlen(path) == 0) {
+        LOG_WARN("NULL or empty path for MIME type detection");
+        return "application/octet-stream";
+    }
+    
     const char *ext = strrchr(path, '.');
-    if (!ext) return mime_types[0].type;
+    if (!ext) {
+        LOG_DEBUG("No extension found in path: %s", path);
+        return "application/octet-stream";
+    }
+    
+    if (strlen(ext) > 10) {
+        LOG_WARN("Extension too long in path: %s", path);
+        return "application/octet-stream";
+    }
     
     for (int i = 0; mime_types[i].ext != NULL; i++) {
         if (strcasecmp(ext, mime_types[i].ext) == 0) {
@@ -377,7 +686,8 @@ const char *http_get_mime_type(const char *path) {
         }
     }
     
-    return mime_types[0].type;
+    LOG_DEBUG("Unknown file extension: %s", ext);
+    return "application/octet-stream";
 }
 
 int http_serve_file(const char *path, http_response_t *response, const http_request_t *request) {
@@ -797,6 +1107,29 @@ void http_free_response(http_response_t *response) {
 }
 
 static int validate_and_resolve_path(const char *root_dir, const char *request_path, char *resolved_path, size_t resolved_path_size) {
+    if (!root_dir || !request_path || !resolved_path || resolved_path_size == 0) {
+        LOG_ERROR("Invalid parameters for path validation");
+        return -1;
+    }
+    
+    if (strlen(root_dir) == 0 || strlen(root_dir) >= PATH_MAX - 1) {
+        LOG_ERROR("Invalid root directory length");
+        return -1;
+    }
+    
+    if (strlen(request_path) == 0 || strlen(request_path) >= PATH_MAX - 1) {
+        LOG_ERROR("Invalid request path length");
+        return -1;
+    }
+    
+    for (const char *p = request_path; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c < 32 || c == 127) {
+            LOG_WARN("Invalid character in path: byte value %d", c);
+            return -1;
+        }
+    }
+    
     if (strstr(request_path, "..") != NULL) {
         LOG_WARN("Path traversal attempt detected: %s", request_path);
         return -1;
@@ -827,6 +1160,7 @@ static int validate_and_resolve_path(const char *root_dir, const char *request_p
             
             char canonical_dir[PATH_MAX];
             if (realpath(temp_dir, canonical_dir) == NULL) {
+                LOG_WARN("Cannot resolve parent directory: %s", temp_dir);
                 return -1;
             }
             
@@ -843,8 +1177,21 @@ static int validate_and_resolve_path(const char *root_dir, const char *request_p
                 return -1;
             }
             
+            const char *filename = last_slash + 1;
+            if (strlen(filename) == 0 || strlen(filename) > 255) {
+                LOG_WARN("Invalid filename: %s", filename);
+                return -1;
+            }
+            
+            for (const char *p = filename; *p; p++) {
+                if (*p == '/' || *p == '\0' || (unsigned char)*p < 32) {
+                    LOG_WARN("Invalid character in filename: %s", filename);
+                    return -1;
+                }
+            }
+            
             size_t dir_len = strlen(canonical_dir);
-            size_t file_len = strlen(last_slash + 1);
+            size_t file_len = strlen(filename);
             if (dir_len + 1 + file_len >= sizeof(canonical_path)) {
                 LOG_ERROR("Reconstructed path too long");
                 return -1;
@@ -852,7 +1199,7 @@ static int validate_and_resolve_path(const char *root_dir, const char *request_p
             strncpy(canonical_path, canonical_dir, sizeof(canonical_path) - 1);
             canonical_path[sizeof(canonical_path) - 1] = '\0';
             strncat(canonical_path, "/", sizeof(canonical_path) - strlen(canonical_path) - 1);
-            strncat(canonical_path, last_slash + 1, sizeof(canonical_path) - strlen(canonical_path) - 1);
+            strncat(canonical_path, filename, sizeof(canonical_path) - strlen(canonical_path) - 1);
         } else {
             char canonical_root[PATH_MAX];
             if (realpath(root_dir, canonical_root) == NULL) {

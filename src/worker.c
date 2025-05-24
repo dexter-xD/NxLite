@@ -396,6 +396,11 @@ void worker_handle_connection(worker_t *worker, int client_fd) {
 }
 
 void worker_handle_client_data(worker_t *worker, int client_fd) {
+    if (!worker || client_fd < 0) {
+        LOG_ERROR("Invalid parameters for client data handling");
+        return;
+    }
+    
     client_conn_t *client = NULL;
     for (int i = 0; i < worker->client_count; i++) {
         if (worker->clients[i].fd == client_fd) {
@@ -404,54 +409,86 @@ void worker_handle_client_data(worker_t *worker, int client_fd) {
         }
     }
     if (!client || !client->buffer) {
+        LOG_WARN("Client or buffer not found for fd=%d", client_fd);
         return;
     }
 
     ssize_t bytes_read;
     int total_read = 0;
     int __attribute__((unused)) processed = 0;
+    
+    const size_t max_read_size = BUFFER_SIZE - 1;  
 
-    while ((bytes_read = recv(client_fd, client->buffer + total_read, BUFFER_SIZE - total_read - 1, 0)) > 0) {
+    while ((bytes_read = recv(client_fd, client->buffer + total_read, max_read_size - total_read, 0)) > 0) {
         total_read += bytes_read;
-        if ((size_t)total_read >= BUFFER_SIZE - 1) {
+        
+        if ((size_t)total_read >= max_read_size) {
+            LOG_WARN("Buffer limit reached for client fd=%d", client_fd);
             break;
         }
     }
 
     if (total_read > 0) {
+        if ((size_t)total_read >= BUFFER_SIZE) {
+            LOG_ERROR("Buffer overflow prevention for fd=%d", client_fd);
+            worker_remove_client(worker, client_fd);
+            return;
+        }
+        
         client->buffer[total_read] = '\0';
         client->last_activity = time(NULL);
         int offset = 0;
         
-        while (offset < total_read) {
+        int requests_processed = 0;
+        const int max_requests_per_connection = 1000;  
+        
+        while (offset < total_read && requests_processed < max_requests_per_connection) {
             char *end = strstr(client->buffer + offset, "\r\n\r\n");
             if (!end) {
                 if (offset > 0 && offset < total_read) {
-                    memmove(client->buffer, client->buffer + offset, total_read - offset);
+                    size_t remaining = total_read - offset;
+                    if (remaining > 0 && remaining < BUFFER_SIZE) {
+                        memmove(client->buffer, client->buffer + offset, remaining);
+                    }
                 }
                 break;
             }
 
             int req_len = end - (client->buffer + offset) + 4;
             
+            if (req_len <= 0 || req_len > MAX_REQUEST_SIZE) {
+                LOG_WARN("Invalid request length %d for fd=%d", req_len, client_fd);
+                worker_remove_client(worker, client_fd);
+                return;
+            }
+            
             http_request_t request;
+            memset(&request, 0, sizeof(request));
+            
             if (http_parse_request(client->buffer + offset, req_len, &request) != 0) {
                 LOG_ERROR("Failed to parse HTTP request from fd=%d", client_fd);
                 http_response_t response;
                 http_create_response(&response, 400);
-                response.keep_alive = 0;  // Force close on error
+                response.keep_alive = 0;  
                 http_send_response(client_fd, &response);
+                http_free_response(&response);
                 worker_remove_client(worker, client_fd);
                 return;
             }
+            
+            if (!http_validate_request(&request)) {
+                LOG_DEBUG("HTTP request validation warning for fd=%d", client_fd);
+            }
 
             http_response_t response;
+            memset(&response, 0, sizeof(response));
             http_handle_request(&request, &response);
             
             client->keep_alive = response.keep_alive;
             
             int send_result = http_send_response(client_fd, &response);
             if (send_result == -1) {
+                http_free_response(&response);
                 worker_remove_client(worker, client_fd);
                 return;
             } else if (send_result == 0) {
@@ -461,6 +498,7 @@ void worker_handle_client_data(worker_t *worker, int client_fd) {
                 
                 if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_MOD, client_fd, &ev) == -1) {
                     LOG_ERROR("Failed to modify client epoll events for write: %s", strerror(errno));
+                    http_free_response(&response);
                     worker_remove_client(worker, client_fd);
                     return;
                 }
@@ -475,6 +513,7 @@ void worker_handle_client_data(worker_t *worker, int client_fd) {
             http_free_response(&response);
             
             processed++;
+            requests_processed++;
             offset += req_len;
 
             if (!client->keep_alive) {
@@ -495,12 +534,25 @@ void worker_handle_client_data(worker_t *worker, int client_fd) {
                 return;
             }
         }
+        
+        if (requests_processed >= max_requests_per_connection) {
+            LOG_INFO("Maximum requests per connection reached for fd=%d, closing", client_fd);
+            worker_remove_client(worker, client_fd);
+            return;
+        }
 
         if (offset < total_read) {
-            memmove(client->buffer, client->buffer + offset, total_read - offset);
+            size_t remaining = total_read - offset;
+            if (remaining > 0 && remaining < BUFFER_SIZE) {
+                memmove(client->buffer, client->buffer + offset, remaining);
+            }
         }
     } else if (bytes_read == 0 || (bytes_read == -1 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-        LOG_INFO("Connection closed by client: fd=%d", client_fd);
+        if (bytes_read == 0) {
+            LOG_DEBUG("Connection closed by client: fd=%d", client_fd);
+        } else {
+            LOG_DEBUG("Connection error for fd=%d: %s", client_fd, strerror(errno));
+        }
         worker_remove_client(worker, client_fd);
     }
 }
