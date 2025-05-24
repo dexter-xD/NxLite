@@ -557,7 +557,8 @@ int http_send_response(int client_fd, http_response_t *response) {
             return -1;
         }
         
-        off_t offset = response->file_offset; 
+        off_t offset = response->file_offset;
+        size_t __attribute__((unused)) total_sent = 0;
         size_t remaining = response->body_length - offset;
         
         const size_t CHUNK_SIZE = 1024 * 1024;
@@ -578,6 +579,7 @@ int http_send_response(int client_fd, http_response_t *response) {
                 return -1;
             }
             
+            total_sent += sent;
             remaining -= sent;
         }
         

@@ -394,6 +394,7 @@ void worker_handle_client_data(worker_t *worker, int client_fd) {
 
     ssize_t bytes_read;
     int total_read = 0;
+    int __attribute__((unused)) processed = 0;
 
     while ((bytes_read = recv(client_fd, client->buffer + total_read, BUFFER_SIZE - total_read - 1, 0)) > 0) {
         total_read += bytes_read;
@@ -458,6 +459,7 @@ void worker_handle_client_data(worker_t *worker, int client_fd) {
             
             http_free_response(&response);
             
+            processed++;
             offset += req_len;
 
             if (!client->keep_alive) {
