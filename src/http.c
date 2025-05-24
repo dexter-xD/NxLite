@@ -1,5 +1,4 @@
 #include "http.h"
-#include <pthread.h>
 
 
 static const struct {
@@ -40,21 +39,6 @@ static const struct {
 
 static char header_buffer[8192];
 
-typedef struct {
-    unsigned long cache_hits;
-    unsigned long cache_misses;
-    unsigned long cache_evictions;
-    unsigned long cache_allocations;
-    unsigned long cache_frees;
-    size_t total_memory_used;
-    size_t max_memory_used;
-    time_t last_cleanup_time;
-} cache_stats_t;
-
-static cache_stats_t cache_stats = {0};
-
-static pthread_mutex_t cache_mutex = PTHREAD_MUTEX_INITIALIZER;
-
 static unsigned int hash_key(const char *key) {
     unsigned int hash = 5381;
     int c;
@@ -75,54 +59,6 @@ typedef struct {
 
 static cache_entry_t response_cache[CACHE_SIZE];
 static int cache_index = 0;
-
-static void update_cache_stats_on_allocation(size_t size) {
-    cache_stats.cache_allocations++;
-    cache_stats.total_memory_used += size;
-    if (cache_stats.total_memory_used > cache_stats.max_memory_used) {
-        cache_stats.max_memory_used = cache_stats.total_memory_used;
-    }
-}
-
-static void update_cache_stats_on_free(size_t size) {
-    cache_stats.cache_frees++;
-    if (cache_stats.total_memory_used >= size) {
-        cache_stats.total_memory_used -= size;
-    } else {
-        cache_stats.total_memory_used = 0;
-    }
-}
-
-static void cleanup_expired_cache_entries(void) {
-    time_t now = time(NULL);
-    int cleaned = 0;
-    
-    if (now - cache_stats.last_cleanup_time < 300) {
-        return;
-    }
-    
-    for (int i = 0; i < CACHE_SIZE; i++) {
-        if (response_cache[i].path[0] != '\0' && 
-            (now - response_cache[i].timestamp >= CACHE_TIMEOUT)) {
-            
-            if (response_cache[i].response) {
-                update_cache_stats_on_free(response_cache[i].response_len);
-                free(response_cache[i].response);
-                response_cache[i].response = NULL;
-            }
-            
-            memset(&response_cache[i], 0, sizeof(cache_entry_t));
-            cleaned++;
-            cache_stats.cache_evictions++;
-        }
-    }
-    
-    cache_stats.last_cleanup_time = now;
-    if (cleaned > 0) {
-        LOG_DEBUG("Cleaned up %d expired cache entries, total memory: %zu bytes", 
-                  cleaned, cache_stats.total_memory_used);
-    }
-}
 
 static void generate_vary_key(const char *path, const http_request_t *request, char *key, size_t key_size) {
     if (!request) {
@@ -150,7 +86,7 @@ static void generate_vary_key(const char *path, const http_request_t *request, c
     
     if (strchr(key, ':') && key[strlen(key)-1] == ':') {
         size_t current_len = strlen(key);
-        if (current_len + 4 < key_size) { 
+        if (current_len + 4 < key_size) {  // "none" is 4 chars + null terminator
             snprintf(key + current_len, key_size - current_len, "none");
         }
     }
@@ -162,20 +98,13 @@ static cache_entry_t *find_cached_response(const char *path, const http_request_
     
     LOG_DEBUG("Cache lookup: path='%s', vary_key='%s'", path, vary_key);
     
-    pthread_mutex_lock(&cache_mutex);
-    
-    cleanup_expired_cache_entries();
-    
     unsigned int hash_idx = hash_key(vary_key);
     if (response_cache[hash_idx].path[0] != '\0' && 
         strcmp(response_cache[hash_idx].path, path) == 0 &&
         strcmp(response_cache[hash_idx].vary_key, vary_key) == 0 &&
         time(NULL) - response_cache[hash_idx].timestamp < CACHE_TIMEOUT) {
         LOG_DEBUG("Cache hit (hash) for %s with vary key %s", path, vary_key);
-        cache_entry_t *result = &response_cache[hash_idx];
-        cache_stats.cache_hits++;
-        pthread_mutex_unlock(&cache_mutex);
-        return result;
+        return &response_cache[hash_idx];
     }
     
     for (int i = 0; i < CACHE_SIZE; i++) {
@@ -191,42 +120,16 @@ static cache_entry_t *find_cached_response(const char *path, const http_request_
             strcmp(response_cache[i].vary_key, vary_key) == 0 &&
             time(NULL) - response_cache[i].timestamp < CACHE_TIMEOUT) {
             LOG_DEBUG("Cache hit (linear) for %s with vary key %s", path, vary_key);
-            cache_entry_t *result = &response_cache[i];
-            cache_stats.cache_hits++;
-            pthread_mutex_unlock(&cache_mutex);
-            return result;
+            return &response_cache[i];
         }
     }
     LOG_DEBUG("Cache miss for %s with vary key %s", path, vary_key);
-    cache_stats.cache_misses++;
-    pthread_mutex_unlock(&cache_mutex);
     return NULL;
 }
 
 static void cache_response(const char *path, const char *response, size_t response_len, const http_request_t *request, const char *etag) {
     char vary_key[256];
     generate_vary_key(path, request, vary_key, sizeof(vary_key));
-    
-    const size_t MAX_CACHE_ENTRY_SIZE = 5 * 1024 * 1024;
-    if (response_len > MAX_CACHE_ENTRY_SIZE) {
-        LOG_DEBUG("Response too large to cache: %zu bytes (max: %zu)", response_len, MAX_CACHE_ENTRY_SIZE);
-        return;
-    }
-    
-    pthread_mutex_lock(&cache_mutex);
-    
-    const size_t MAX_TOTAL_CACHE_MEMORY = 100 * 1024 * 1024; // 100MB total cache limit
-    if (cache_stats.total_memory_used + response_len > MAX_TOTAL_CACHE_MEMORY) {
-        LOG_DEBUG("Cache memory limit reached (%zu + %zu > %zu), triggering cleanup", 
-                  cache_stats.total_memory_used, response_len, MAX_TOTAL_CACHE_MEMORY);
-        cleanup_expired_cache_entries();
-        
-        if (cache_stats.total_memory_used + response_len > MAX_TOTAL_CACHE_MEMORY) {
-            LOG_WARN("Cache memory limit exceeded even after cleanup, skipping cache for this response");
-            pthread_mutex_unlock(&cache_mutex);
-            return;
-        }
-    }
     
     unsigned int hash_idx = hash_key(vary_key);
     cache_entry_t *entry = &response_cache[hash_idx];
@@ -238,12 +141,9 @@ static void cache_response(const char *path, const char *response, size_t respon
     }
     
     if (entry->response) {
-        update_cache_stats_on_free(entry->response_len);
         free(entry->response);
         entry->response = NULL;
     }
-    
-    memset(entry, 0, sizeof(cache_entry_t));
     
     strncpy(entry->path, path, PATH_MAX - 1);
     entry->path[PATH_MAX - 1] = '\0';
@@ -260,269 +160,56 @@ static void cache_response(const char *path, const char *response, size_t respon
         memcpy(entry->response, response, response_len);
         entry->response_len = response_len;
         entry->timestamp = time(NULL);
-        update_cache_stats_on_allocation(response_len);
-        LOG_DEBUG("Cached response for %s with vary key %s (%zu bytes, total cache memory: %zu bytes)", 
-                  path, entry->vary_key, response_len, cache_stats.total_memory_used);
+        LOG_DEBUG("Cached response for %s with vary key %s", path, entry->vary_key);
     } else {
-        LOG_ERROR("Failed to allocate memory for cached response (%zu bytes)", response_len);
-        memset(entry, 0, sizeof(cache_entry_t));
+        LOG_ERROR("Failed to allocate memory for cached response");
     }
-    
-    pthread_mutex_unlock(&cache_mutex);
-}
-
-static int is_valid_http_method(const char *method) {
-    if (!method || strlen(method) == 0 || strlen(method) >= MAX_METHOD_SIZE) {
-        return 0;
-    }
-    
-    static const char *valid_methods[] = {
-        "GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "TRACE", "CONNECT", NULL
-    };
-    
-    for (int i = 0; valid_methods[i] != NULL; i++) {
-        if (strcmp(method, valid_methods[i]) == 0) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
-static int is_valid_http_version(const char *version) {
-    if (!version || strlen(version) == 0) {
-        return 0;
-    }
-    
-    return (strcmp(version, "HTTP/1.0") == 0 || 
-            strcmp(version, "HTTP/1.1") == 0 || 
-            strcmp(version, "HTTP/2") == 0);
-}
-
-static int is_valid_uri(const char *uri) {
-    if (!uri || strlen(uri) == 0 || strlen(uri) >= MAX_URI_SIZE) {
-        return 0;
-    }
-    
-    if (uri[0] != '/') {
-        return 0;
-    }
-    
-    for (const char *p = uri; *p; p++) {
-        unsigned char c = (unsigned char)*p;
-        
-        if (c == '\0' || c == '\r' || c == '\n') {
-            return 0;
-        }
-        
-        if (c < 32 || c == 127) {
-            return 0;
-        }
-        
-        if (c == '<' || c == '>' || c == '"' || c == '{' || c == '}' || c == '|' || c == '\\' || c == '^' || c == '`') {
-            return 0;
-        }
-    }
-    
-    return 1;
-}
-
-static int is_valid_header_name(const char *name) {
-    if (!name || strlen(name) == 0 || strlen(name) >= MAX_HEADER_SIZE) {
-        return 0;
-    }
-    
-    for (const char *p = name; *p; p++) {
-        unsigned char c = (unsigned char)*p;
-        
-        if (c <= 32 || c >= 127) {
-            return 0;
-        }
-        
-        if (strchr("()<>@,;:\\\"/[]?={} \t", c)) {
-            return 0;
-        }
-    }
-    
-    return 1;
-}
-
-static int is_valid_header_value(const char *value) {
-    if (!value || strlen(value) >= MAX_HEADER_SIZE) {
-        return 0;
-    }
-    
-    for (const char *p = value; *p; p++) {
-        unsigned char c = (unsigned char)*p;
-        
-        if (c == '\0' || c == '\r' || c == '\n') {
-            return 0;
-        }
-        
-        if (c < 32 && c != '\t') {
-            return 0;
-        }
-    }
-    
-    return 1;
-}
-
-static size_t sanitize_input_buffer(char *buffer, size_t length) {
-    if (!buffer || length == 0) {
-        return 0;
-    }
-    
-    size_t write_pos = 0;
-    for (size_t i = 0; i < length; i++) {
-        unsigned char c = (unsigned char)buffer[i];
-        
-        if (c == '\0') {
-            break;
-        }
-        
-        if (c >= 32 || c == '\t' || c == '\r' || c == '\n') {
-            buffer[write_pos++] = buffer[i];
-        }
-    }
-    
-    buffer[write_pos] = '\0';
-    return write_pos;
 }
 
 int http_parse_request(const char *buffer, size_t length, http_request_t *request) {
-    if (!buffer || !request || length == 0 || length > 1024 * 1024) {
-        LOG_WARN("Invalid parameters for HTTP request parsing");
-        return -1;
-    }
-    
-    memset(request, 0, sizeof(http_request_t));
-    
-    char *sanitized_buffer = malloc(length + 1);
-    if (!sanitized_buffer) {
-        LOG_ERROR("Failed to allocate memory for request sanitization");
-        return -1;
-    }
-    
-    memcpy(sanitized_buffer, buffer, length);
-    sanitized_buffer[length] = '\0';
-    
-    size_t sanitized_length = sanitize_input_buffer(sanitized_buffer, length);
-    if (sanitized_length == 0) {
-        LOG_WARN("Request buffer sanitization resulted in empty buffer");
-        free(sanitized_buffer);
-        return -1;
-    }
-    
-    char *line_start = sanitized_buffer;
+    char *line_start = (char *)buffer;
     char *line_end;
     
     request->keep_alive = 0;
     
     line_end = strstr(line_start, "\r\n");
-    if (!line_end || line_end - line_start > 8192) {
-        LOG_WARN("Invalid or oversized request line");
-        free(sanitized_buffer);
-        return -1;
-    }
+    if (!line_end) return -1;
     
-    char method[MAX_METHOD_SIZE], uri[MAX_URI_SIZE], version[16];
-    memset(method, 0, sizeof(method));
-    memset(uri, 0, sizeof(uri));
-    memset(version, 0, sizeof(version));
-    
+    char method[16], uri[2048], version[16];
     if (sscanf(line_start, "%15s %2047s %15s", method, uri, version) != 3) {
-        LOG_WARN("Failed to parse HTTP request line");
-        free(sanitized_buffer);
-        return -1;
-    }
-    
-    if (!is_valid_http_method(method)) {
-        LOG_WARN("Invalid HTTP method: %s", method);
-        free(sanitized_buffer);
-        return -1;
-    }
-    
-    if (!is_valid_uri(uri)) {
-        LOG_WARN("Invalid URI: %s", uri);
-        free(sanitized_buffer);
-        return -1;
-    }
-    
-    if (!is_valid_http_version(version)) {
-        LOG_WARN("Invalid HTTP version: %s", version);
-        free(sanitized_buffer);
         return -1;
     }
     
     strncpy(request->method, method, sizeof(request->method) - 1);
-    request->method[sizeof(request->method) - 1] = '\0';
-    
     strncpy(request->uri, uri, sizeof(request->uri) - 1);
-    request->uri[sizeof(request->uri) - 1] = '\0';
-    
     strncpy(request->version, version, sizeof(request->version) - 1);
-    request->version[sizeof(request->version) - 1] = '\0';
     
     line_start = line_end + 2;
     request->header_count = 0;
     
-    while (line_start < sanitized_buffer + sanitized_length && request->header_count < MAX_HEADERS) {
+    while (line_start < (char *)buffer + length && request->header_count < MAX_HEADERS) {
         line_end = strstr(line_start, "\r\n");
         if (!line_end) break;
         
         if (line_end == line_start) break;
         
-        if (line_end - line_start > MAX_HEADER_SIZE * 2) {
-            LOG_WARN("Header line too long");
-            free(sanitized_buffer);
-            return -1;
-        }
-        
         char *colon = strchr(line_start, ':');
         if (colon) {
             *colon = '\0';
             char *value = colon + 1;
-            while (*value == ' ' || *value == '\t') value++;
-            
-            char *value_end = line_end - 1;
-            while (value_end > value && (*value_end == ' ' || *value_end == '\t')) {
-                *value_end = '\0';
-                value_end--;
-            }
-            
-            if (!is_valid_header_name(line_start)) {
-                LOG_DEBUG("Questionable header name: %s", line_start);
-                *colon = ':';  
-                line_start = line_end + 2;
-                continue;
-            }
-            
-            if (!is_valid_header_value(value)) {
-                LOG_DEBUG("Questionable header value for %s", line_start);
-                *colon = ':';  
-                line_start = line_end + 2;
-                continue;
-            }
+            while (*value == ' ') value++;
             
             strncpy(request->headers[request->header_count][0], line_start, MAX_HEADER_SIZE - 1);
-            request->headers[request->header_count][0][MAX_HEADER_SIZE - 1] = '\0';
-            
             strncpy(request->headers[request->header_count][1], value, MAX_HEADER_SIZE - 1);
-            request->headers[request->header_count][1][MAX_HEADER_SIZE - 1] = '\0';
             
             if (strcasecmp(line_start, "Connection") == 0) {
                 LOG_DEBUG("Found Connection header: %s", value);
             }
             
             request->header_count++;
-        } else {
-            LOG_WARN("Malformed header line (no colon)");
         }
         
         line_start = line_end + 2;
-    }
-    
-    if (request->header_count >= MAX_HEADERS) {
-        LOG_WARN("Too many headers in request (max: %d)", MAX_HEADERS);
     }
     
     request->keep_alive = (strcmp(request->version, "HTTP/1.1") == 0);
@@ -543,79 +230,19 @@ int http_parse_request(const char *buffer, size_t length, http_request_t *reques
     LOG_DEBUG("Request parsed: %s %s %s, keep-alive=%d", 
               request->method, request->uri, request->version, request->keep_alive);
     
-    free(sanitized_buffer);
     return 0;
 }
 
-int http_validate_request(const http_request_t *request) {
-    if (!request) {
-        return 0;
-    }
-    
-    if (strlen(request->method) == 0 || strlen(request->method) >= MAX_METHOD_SIZE) {
-        return 0;
-    }
-    
-    if (strlen(request->uri) == 0 || strlen(request->uri) >= MAX_URI_SIZE) {
-        return 0;
-    }
-    
-    if (strlen(request->version) == 0 || strlen(request->version) >= 16) {
-        return 0;
-    }
-    
-    if (request->header_count < 0 || request->header_count > MAX_HEADERS) {
-        return 0;
-    }
-    
-    for (int i = 0; i < request->header_count; i++) {
-        if (!http_validate_header_name(request->headers[i][0]) ||
-            !http_validate_header_value(request->headers[i][1])) {
-            return 0;
-        }
-    }
-    
-    return 1;
-}
-
-int http_validate_status_code(int status_code) {
-    return (status_code >= 100 && status_code <= 599);
-}
-
-int http_validate_header_name(const char *name) {
-    return is_valid_header_name(name);
-}
-
-int http_validate_header_value(const char *value) {
-    return is_valid_header_value(value);
-}
-
 void http_create_response(http_response_t *response, int status_code) {
-    if (!response) {
-        LOG_ERROR("NULL response pointer in http_create_response");
-        return;
-    }
-    
-    if (!http_validate_status_code(status_code)) {
-        LOG_WARN("Invalid status code %d, using 500", status_code);
-        status_code = 500;
-    }
-    
     memset(response, 0, sizeof(http_response_t));
     response->status_code = status_code;
     response->keep_alive = 0;  
-    response->file_fd = -1; 
     
     for (int i = 0; status_messages[i].code != 0; i++) {
         if (status_messages[i].code == status_code) {
             response->status_text = status_messages[i].text;
             break;
         }
-    }
-    
-    if (!response->status_text) {
-        response->status_text = "Unknown Status";
-        LOG_WARN("No status text found for code %d", status_code);
     }
     
     response->compression_type = COMPRESSION_NONE;
@@ -627,58 +254,16 @@ void http_create_response(http_response_t *response, int status_code) {
 }
 
 void http_add_header(http_response_t *response, const char *name, const char *value) {
-    if (!response) {
-        LOG_ERROR("NULL response pointer in http_add_header");
-        return;
+    if (response->header_count < MAX_HEADERS) {
+        strncpy(response->headers[response->header_count][0], name, MAX_HEADER_SIZE - 1);
+        strncpy(response->headers[response->header_count][1], value, MAX_HEADER_SIZE - 1);
+        response->header_count++;
     }
-    
-    if (!name || !value) {
-        LOG_WARN("NULL header name or value in http_add_header");
-        return;
-    }
-    
-    if (!http_validate_header_name(name)) {
-        LOG_WARN("Invalid header name: %s", name);
-        return;
-    }
-    
-    if (!http_validate_header_value(value)) {
-        LOG_WARN("Invalid header value for %s", name);
-        return;
-    }
-    
-    if (response->header_count >= MAX_HEADERS) {
-        LOG_WARN("Cannot add header %s: %s - maximum headers reached (%d)", name, value, MAX_HEADERS);
-        return;
-    }
-    
-    strncpy(response->headers[response->header_count][0], name, MAX_HEADER_SIZE - 1);
-    response->headers[response->header_count][0][MAX_HEADER_SIZE - 1] = '\0';
-    
-    strncpy(response->headers[response->header_count][1], value, MAX_HEADER_SIZE - 1);
-    response->headers[response->header_count][1][MAX_HEADER_SIZE - 1] = '\0';
-    
-    response->header_count++;
-    
-    LOG_DEBUG("Added header: %s: %s", name, value);
 }
 
 const char *http_get_mime_type(const char *path) {
-    if (!path || strlen(path) == 0) {
-        LOG_WARN("NULL or empty path for MIME type detection");
-        return "application/octet-stream";
-    }
-    
     const char *ext = strrchr(path, '.');
-    if (!ext) {
-        LOG_DEBUG("No extension found in path: %s", path);
-        return "application/octet-stream";
-    }
-    
-    if (strlen(ext) > 10) {
-        LOG_WARN("Extension too long in path: %s", path);
-        return "application/octet-stream";
-    }
+    if (!ext) return mime_types[0].type;
     
     for (int i = 0; mime_types[i].ext != NULL; i++) {
         if (strcasecmp(ext, mime_types[i].ext) == 0) {
@@ -686,8 +271,7 @@ const char *http_get_mime_type(const char *path) {
         }
     }
     
-    LOG_DEBUG("Unknown file extension: %s", ext);
-    return "application/octet-stream";
+    return mime_types[0].type;
 }
 
 int http_serve_file(const char *path, http_response_t *response, const http_request_t *request) {
@@ -1080,67 +664,35 @@ int http_send_response(int client_fd, http_response_t *response) {
 }
 
 void http_free_response(http_response_t *response) {
-    if (!response) {
-        return;
-    }
-    
     if (response->is_file && response->file_fd != -1) {
         close(response->file_fd);
-        response->file_fd = -1; 
-        response->is_file = 0;
     }
     
     if (response->body) {
         free(response->body);
         response->body = NULL;
-        response->body_length = 0;
     }
     
     if (response->compressed_body) {
         free(response->compressed_body);
         response->compressed_body = NULL;
-        response->compressed_length = 0;
     }
-    
-    response->is_cached = 0;
-    response->cached_response = NULL;
 }
 
 static int validate_and_resolve_path(const char *root_dir, const char *request_path, char *resolved_path, size_t resolved_path_size) {
-    if (!root_dir || !request_path || !resolved_path || resolved_path_size == 0) {
-        LOG_ERROR("Invalid parameters for path validation");
-        return -1;
-    }
-    
-    if (strlen(root_dir) == 0 || strlen(root_dir) >= PATH_MAX - 1) {
-        LOG_ERROR("Invalid root directory length");
-        return -1;
-    }
-    
-    if (strlen(request_path) == 0 || strlen(request_path) >= PATH_MAX - 1) {
-        LOG_ERROR("Invalid request path length");
-        return -1;
-    }
-    
-    for (const char *p = request_path; *p; p++) {
-        unsigned char c = (unsigned char)*p;
-        if (c < 32 || c == 127) {
-            LOG_WARN("Invalid character in path: byte value %d", c);
-            return -1;
-        }
-    }
-    
+    // First, check for obvious path traversal attempts
     if (strstr(request_path, "..") != NULL) {
         LOG_WARN("Path traversal attempt detected: %s", request_path);
         return -1;
     }
-        
     
+    // Check for null bytes (could be used to bypass checks)
     if (strlen(request_path) != strcspn(request_path, "\0")) {
         LOG_WARN("Null byte in path: %s", request_path);
         return -1;
     }
     
+    // Build the full path
     char temp_path[PATH_MAX];
     int written = snprintf(temp_path, sizeof(temp_path), "%s%s", root_dir, request_path);
     if (written < 0 || (size_t)written >= sizeof(temp_path)) {
@@ -1148,8 +700,11 @@ static int validate_and_resolve_path(const char *root_dir, const char *request_p
         return -1;
     }
     
+    // Resolve the canonical path
     char canonical_path[PATH_MAX];
     if (realpath(temp_path, canonical_path) == NULL) {
+        // If realpath fails, the file might not exist yet, but we still need to validate the directory structure
+        // Try to resolve the parent directory and validate
         char temp_dir[PATH_MAX];
         strncpy(temp_dir, temp_path, sizeof(temp_dir) - 1);
         temp_dir[sizeof(temp_dir) - 1] = '\0';
@@ -1160,10 +715,11 @@ static int validate_and_resolve_path(const char *root_dir, const char *request_p
             
             char canonical_dir[PATH_MAX];
             if (realpath(temp_dir, canonical_dir) == NULL) {
-                LOG_WARN("Cannot resolve parent directory: %s", temp_dir);
+                // Parent directory doesn't exist or is inaccessible
                 return -1;
             }
             
+            // Verify parent directory is within root
             char canonical_root[PATH_MAX];
             if (realpath(root_dir, canonical_root) == NULL) {
                 LOG_ERROR("Cannot resolve root directory: %s", root_dir);
@@ -1177,30 +733,21 @@ static int validate_and_resolve_path(const char *root_dir, const char *request_p
                 return -1;
             }
             
-            const char *filename = last_slash + 1;
-            if (strlen(filename) == 0 || strlen(filename) > 255) {
-                LOG_WARN("Invalid filename: %s", filename);
-                return -1;
-            }
-            
-            for (const char *p = filename; *p; p++) {
-                if (*p == '/' || *p == '\0' || (unsigned char)*p < 32) {
-                    LOG_WARN("Invalid character in filename: %s", filename);
-                    return -1;
-                }
-            }
-            
+            // Reconstruct the full path with the canonical directory
+            // Check that the combined length won't exceed buffer size
             size_t dir_len = strlen(canonical_dir);
-            size_t file_len = strlen(filename);
+            size_t file_len = strlen(last_slash + 1);
             if (dir_len + 1 + file_len >= sizeof(canonical_path)) {
                 LOG_ERROR("Reconstructed path too long");
                 return -1;
             }
+            // Use safer string operations to avoid format truncation warnings
             strncpy(canonical_path, canonical_dir, sizeof(canonical_path) - 1);
             canonical_path[sizeof(canonical_path) - 1] = '\0';
             strncat(canonical_path, "/", sizeof(canonical_path) - strlen(canonical_path) - 1);
-            strncat(canonical_path, filename, sizeof(canonical_path) - strlen(canonical_path) - 1);
+            strncat(canonical_path, last_slash + 1, sizeof(canonical_path) - strlen(canonical_path) - 1);
         } else {
+            // No directory separator found, use the temp_path as is but validate root
             char canonical_root[PATH_MAX];
             if (realpath(root_dir, canonical_root) == NULL) {
                 LOG_ERROR("Cannot resolve root directory: %s", root_dir);
@@ -1211,12 +758,14 @@ static int validate_and_resolve_path(const char *root_dir, const char *request_p
         }
     }
     
+    // Resolve the canonical root directory
     char canonical_root[PATH_MAX];
     if (realpath(root_dir, canonical_root) == NULL) {
         LOG_ERROR("Cannot resolve root directory: %s", root_dir);
         return -1;
     }
     
+    // Ensure the canonical path is within the root directory
     size_t root_len = strlen(canonical_root);
     if (strncmp(canonical_path, canonical_root, root_len) != 0 ||
         (canonical_path[root_len] != '\0' && canonical_path[root_len] != '/')) {
@@ -1225,6 +774,7 @@ static int validate_and_resolve_path(const char *root_dir, const char *request_p
         return -1;
     }
     
+    // Copy the validated path to the output buffer
     if (strlen(canonical_path) >= resolved_path_size) {
         LOG_ERROR("Resolved path too long: %s", canonical_path);
         return -1;
@@ -1781,42 +1331,4 @@ int http_compress_content(http_response_t *response, compression_type_t type, in
     
     deflateEnd(&strm);
     return 0;
-}
-
-void http_cache_cleanup(void) {
-    pthread_mutex_lock(&cache_mutex);
-    
-    for (int i = 0; i < CACHE_SIZE; i++) {
-        if (response_cache[i].response) {
-            update_cache_stats_on_free(response_cache[i].response_len);
-            free(response_cache[i].response);
-            response_cache[i].response = NULL;
-        }
-        memset(&response_cache[i], 0, sizeof(cache_entry_t));
-    }
-    
-    cache_index = 0;
-    
-    LOG_INFO("Cache cleanup completed. Final stats - Hits: %lu, Misses: %lu, Evictions: %lu, "
-             "Allocations: %lu, Frees: %lu, Max Memory: %zu bytes", 
-             cache_stats.cache_hits, cache_stats.cache_misses, cache_stats.cache_evictions,
-             cache_stats.cache_allocations, cache_stats.cache_frees, cache_stats.max_memory_used);
-    
-    memset(&cache_stats, 0, sizeof(cache_stats_t));
-    
-    pthread_mutex_unlock(&cache_mutex);
-    pthread_mutex_destroy(&cache_mutex);
-}
-
-void http_get_cache_stats(unsigned long *hits, unsigned long *misses, unsigned long *evictions, 
-                         size_t *memory_used, size_t *max_memory_used) {
-    pthread_mutex_lock(&cache_mutex);
-    
-    if (hits) *hits = cache_stats.cache_hits;
-    if (misses) *misses = cache_stats.cache_misses;
-    if (evictions) *evictions = cache_stats.cache_evictions;
-    if (memory_used) *memory_used = cache_stats.total_memory_used;
-    if (max_memory_used) *max_memory_used = cache_stats.max_memory_used;
-    
-    pthread_mutex_unlock(&cache_mutex);
 } 

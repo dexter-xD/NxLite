@@ -26,10 +26,6 @@
 #define MAX_URI_SIZE 2048
 #define MAX_METHOD_SIZE 16
 
-#define MAX_REQUEST_SIZE (1024 * 1024)    
-#define MAX_REQUEST_LINE_SIZE 8192        
-#define MAX_HEADER_LINE_SIZE (MAX_HEADER_SIZE * 2)  
-
 typedef enum {
     COMPRESSION_NONE = 0,
     COMPRESSION_GZIP,
@@ -83,14 +79,5 @@ void http_handle_request(const http_request_t *request, http_response_t *respons
 int http_compress_content(http_response_t *response, compression_type_t type, int level);
 compression_type_t http_negotiate_compression(const http_request_t *request);
 int http_should_compress_mime_type(const char *mime_type);
-
-void http_cache_cleanup(void);
-void http_get_cache_stats(unsigned long *hits, unsigned long *misses, unsigned long *evictions, 
-                         size_t *memory_used, size_t *max_memory_used);
-
-int http_validate_request(const http_request_t *request);
-int http_validate_status_code(int status_code);
-int http_validate_header_name(const char *name);
-int http_validate_header_value(const char *value);
 
 #endif 
