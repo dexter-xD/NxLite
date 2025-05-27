@@ -55,7 +55,7 @@ brew install cmake
 
 ```bash
 # Clone the repository
-git clone <repository-url>
+git clone https://github.com/dexter-xD/NxLite.git
 cd NxLite
 
 # Create build directory
