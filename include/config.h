@@ -14,6 +14,7 @@ typedef struct {
     char log_file[256];
     int max_connections;
     int keep_alive_timeout;
+    int development_mode;
 } config_t;
 
 void config_init(config_t *config);

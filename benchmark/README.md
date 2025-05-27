@@ -1,81 +1,160 @@
-# NxLite Benchmark Suite
+# NxLite Test Suite
 
-Scripts for validating NxLite's performance, edge caching, compression, and scalability under various real-world scenarios.
+Testing scripts for validating NxLite's functionality, security, and basic performance characteristics.
 
 ## 🎯 Quick Start
 
 ```bash
-# Fast validation (recommended first test)
+# Security testing (recommended first)
+./vulnerability_test.sh
+./dos_protection_test.sh
+
+# Basic functionality testing
 ./quick_test.sh
 
-# Full comprehensive testing
+# Comprehensive feature testing
 ./comprehensive_test.sh
-
-# Production-ready stress testing
-./production_test.sh
 ```
 
 ## 📋 Test Scripts Overview
 
-### 🚀 Main Test Scripts
+### 🔒 Security Test Scripts
 
-| Script | Duration | Purpose | Use Case |
-|--------|----------|---------|----------|
-| `quick_test.sh` | ~30s | Fast validation | Development, CI/CD |
-| `comprehensive_test.sh` | ~15 min | Complete feature testing | Release validation |
-| `production_test.sh` | ~20 min | Production simulation | Pre-deployment testing |
+| Script | Purpose | Tests |
+|--------|---------|-------|
+| `vulnerability_test.sh` | Security vulnerability testing | Path traversal, header injection, security headers, request limits |
+| `dos_protection_test.sh` | DoS protection validation | Rate limiting, connection flooding, slow loris, malformed requests |
+| `debug_malformed.sh` | Debug malformed request handling | Specific malformed request scenarios |
+
+### 🚀 Performance Test Scripts
+
+| Script | Duration | Purpose |
+|--------|----------|---------|
+| `quick_test.sh` | ~30s | Basic functionality validation |
+| `comprehensive_test.sh` | ~15 min | Complete feature testing |
+| `production_test.sh` | ~20 min | Extended testing scenarios |
+| `conditional_benchmark.sh` | ~5 min | Cache behavior testing |
+| `test_compression.sh` | ~2 min | Compression functionality |
 
 ### 📝 Lua Test Scripts
 
-| Script | Description | Cache Rate | Scenario |
-|--------|-------------|------------|----------|
-| `mixed_cache.lua` | 33% conditional requests | 33% | Typical web traffic |
-| `mixed_cache_50.lua` | 50% conditional requests | 50% | Return visitors |
-| `heavy_cache.lua` | 80% conditional requests | 80% | High repeat traffic |
-| `real_world.lua` | Mixed file types & patterns | 60% | Production simulation |
-| `compression_mix.lua` | Mixed compression testing | 40% | Compression validation |
-| `html_files.lua` | HTML file testing | 50% | Web page serving |
-| `static_assets.lua` | CSS/JS/Images testing | 90%+ | Asset delivery |
-| `mobile_simulation.lua` | Mobile client patterns | 70% | Mobile optimization |
+| Script | Description | Use Case |
+|--------|-------------|----------|
+| `mixed_cache.lua` | Mixed conditional requests | Cache behavior testing |
+| `mixed_cache_50.lua` | 50% conditional requests | Cache validation |
+| `heavy_cache.lua` | High cache hit scenarios | Cache efficiency testing |
+| `real_world.lua` | Mixed file types & patterns | Realistic usage simulation |
+| `compression_mix.lua` | Various compression scenarios | Compression testing |
+| `html_files.lua` | HTML file serving | Web page testing |
+| `static_assets.lua` | CSS/JS/Images testing | Static asset serving |
+| `mobile_simulation.lua` | Mobile client patterns | Mobile compatibility |
 
-## 🏃‍♂️ Running Tests
+## 🔒 Security Testing
 
 ### Prerequisites
 
 ```bash
-# Ensure wrk is installed
+# Ensure server is running
+cd ../build && ./NxLite ../server.conf &
+cd ../benchmark
+
+# Make scripts executable
+chmod +x *.sh
+```
+
+### Vulnerability Testing
+
+```bash
+# Run comprehensive vulnerability tests
+./vulnerability_test.sh
+
+# Example output:
+# NxLite Vulnerability Test Suite
+# ===============================
+# 
+# [✓] Path Traversal Protection: PASS
+# [✓] Header Injection Protection: PASS
+# [✓] Security Headers: PASS (5/5 headers present)
+# [✓] Large Request Handling: PASS
+# [✓] Malformed Request Handling: PASS
+# [✓] Information Disclosure: PASS
+# [✓] HTTP Method Validation: PASS
+# [✓] File Extension Handling: PASS
+# [✓] Null Byte Injection: PASS
+# [✓] Response Splitting: PASS
+# 
+# Overall Security Score: 9/10 tests passed
+```
+
+### DoS Protection Testing
+
+```bash
+# Run DoS protection tests
+./dos_protection_test.sh
+
+# Example output:
+# NxLite DoS Protection Test Suite
+# ================================
+# 
+# Server Mode: PRODUCTION MODE (DoS protection enabled)
+# 
+# [✓] Rate Limiting: PASS (83% requests blocked)
+# [✓] Connection Flooding Protection: PASS
+# [✓] Slow Loris Attack Protection: PASS (100% blocked)
+# [✓] Large Request Flooding: PASS
+# [✓] Concurrent Request Bombing: PASS (39% blocked)
+# [✓] IP-based Rate Limiting: PASS
+# [✓] Malformed Request Flooding: PASS (100% handled)
+# [✓] Resource Exhaustion Protection: PASS
+# [✓] Bandwidth Exhaustion Protection: PASS
+# 
+# Overall DoS Protection Score: 4/9 tests consistently passing
+```
+
+### Development Mode Testing
+
+```bash
+# Test with development mode (DoS protection disabled)
+cd ../build && ./NxLite ../server.conf --dev &
+cd ../benchmark
+
+# Run tests - should show different results
+./dos_protection_test.sh
+```
+
+## 🧪 Functionality Testing
+
+### Prerequisites
+
+```bash
+# Ensure wrk is installed for performance tests
 sudo apt install wrk  # Ubuntu/Debian
 brew install wrk      # macOS
 
 # Ensure server is running
-cd ../build && ./nxlite &
+cd ../build && ./NxLite ../server.conf &
 cd ../benchmark
 ```
 
-### Basic Usage
+### Basic Functionality
 
 ```bash
-# Make scripts executable
-chmod +x *.sh
-
-# Quick performance check
+# Quick functionality check
 ./quick_test.sh
 
-# Example output:
-# Quick NxLite Performance Test
-# =============================
-# 
-# 1. Baseline Performance
-#    Baseline RPS: 194,598.43
-# 
-# 2. Edge Caching (33% conditional)
-#    Cached RPS: 263,696.32
-# 
-# 3. Heavy Caching (80% conditional)
-#    Heavy Cache RPS: 272,816.16
-# 
-# Cache Improvement: 35.5%
-# Heavy Cache Improvement: 40.2%
+# Test specific features
+./conditional_benchmark.sh  # Cache behavior
+./test_compression.sh       # Compression functionality
+```
+
+### Comprehensive Testing
+
+```bash
+# Full feature validation
+./comprehensive_test.sh
+
+# Extended testing scenarios
+./production_test.sh
 ```
 
 ### Individual Test Execution
@@ -88,196 +167,138 @@ wrk -t4 -c100 -d30s -s heavy_cache.lua http://localhost:7877/
 # Test compression
 wrk -t4 -c100 -d30s -H 'Accept-Encoding: gzip' http://localhost:7877/
 
-# Stress testing
-wrk -t8 -c500 -d30s -s mixed_cache.lua http://localhost:7877/
-
-# Real-world simulation
-wrk -t4 -c100 -d60s -s real_world.lua http://localhost:7877/
+# Test different file types
+wrk -t4 -c100 -d30s -s real_world.lua http://localhost:7877/
 ```
 
-## 📊 Expected Results
+## 📊 Test Results
 
-### Performance Baselines
+### Security Test Results
 
-| Test Scenario | Expected RPS | Transfer Rate | Latency |
-|---------------|--------------|---------------|---------|
-| **Baseline** | 80k-100k | 0.8-1.0 GB/s | 1-2ms |
-| **33% Cache** | 200k-300k | 1.5-2.5 GB/s | 200-400μs |
-| **50% Cache** | 250k-350k | 1.0-2.0 GB/s | 200-350μs |
-| **80% Cache** | 250k-400k | 400-800 MB/s | 300-500μs |
-| **Stress (500c)** | 300k-500k | 2.5-3.5 GB/s | 1-3ms |
+Results are saved to:
+- `vulnerability_test_results.txt` - Vulnerability test outcomes
+- `dos_protection_results.txt` - DoS protection test results
 
-### Key Performance Indicators
+### Performance Test Results
 
-- **Cache Hit Improvement**: 150-300% RPS increase
-- **Bandwidth Reduction**: 50-80% with heavy caching
-- **Latency Reduction**: 60-75% improvement
-- **Stress Performance**: 400k+ RPS sustainable
+Results are saved to:
+- `test_results.csv` - Comprehensive test results in CSV format
+
+### Viewing Results
+
+```bash
+# View security test results
+cat vulnerability_test_results.txt
+cat dos_protection_results.txt
+
+# View performance results
+cat test_results.csv | column -t -s,
+
+# Check server logs during testing
+tail -f ../logs/access.log
+```
 
 ## 🔍 Test Details
 
+### vulnerability_test.sh
+
+**Purpose**: Security vulnerability validation  
+**Tests**:
+- Path traversal protection
+- Header injection prevention
+- Security headers validation
+- Request size limits
+- Malformed request handling
+- Information disclosure prevention
+- HTTP method validation
+- File extension security
+- Null byte injection protection
+- Response splitting prevention
+
+### dos_protection_test.sh
+
+**Purpose**: DoS protection validation  
+**Tests**:
+- Rate limiting (100 requests/minute)
+- Connection flooding protection
+- Slow loris attack mitigation
+- Large request flooding
+- Concurrent request bombing
+- IP-based rate limiting
+- Malformed request flooding
+- Resource exhaustion protection
+- Bandwidth exhaustion protection
+
 ### quick_test.sh
 
-**Purpose**: Fast development validation  
+**Purpose**: Basic functionality validation  
 **Duration**: ~30 seconds  
 **Tests**:
-- Baseline performance (10s)
-- 33% caching (10s)
-- 80% caching (10s)
-
-**Usage**:
-```bash
-./quick_test.sh
-```
-
-**Output**: RPS comparison with percentage improvements
-
----
+- Basic server response
+- Cache behavior
+- Compression functionality
 
 ### comprehensive_test.sh
 
 **Purpose**: Complete feature validation  
 **Duration**: ~15 minutes  
 **Test Categories**:
-
-1. **Baseline Tests**
-   - Standard GET requests
-   - ~~HEAD requests~~ (temporarily disabled)
-
-2. **Edge Caching Tests**
-   - 33%, 50%, 80% conditional request scenarios
-   - ETag validation
-   - 304 Not Modified responses
-
-3. **Different File Types**
-   - HTML files with caching
-   - Static assets (CSS, JS, images)
-
-4. **Compression Tests**
-   - Gzip compression
-   - Mixed compression scenarios
-
-5. **Real-World Simulation**
-   - Mixed content types
-   - Realistic user patterns
-   - Mobile client simulation
-
-6. **Stress Tests**
-   - High concurrency (500 connections)
-   - Keep-alive connection testing
-
-**Usage**:
-```bash
-./comprehensive_test.sh
-```
-
-**Output**: Detailed CSV results in `test_results.csv`
-
----
-
-### production_test.sh
-
-**Purpose**: Production readiness validation  
-**Duration**: ~20 minutes  
-**Test Phases**:
-
-1. **Warm-up Phase**
-   - Server and cache warming
-
-2. **Production Load Tests**
-   - Low load (50 concurrent, 60s)
-   - Medium load (200 concurrent, 60s)
-   - High load (500 concurrent, 30s)
-
-3. **Stress Testing**
-   - Traffic spikes (1000 concurrent, 15s)
-   - Sustained load (300 concurrent, 2 minutes)
-
-4. **Edge Cases**
-   - Mobile simulation
-   - Mixed API/static content
-
-**Usage**:
-```bash
-./production_test.sh
-```
-
-**Output**: Production readiness checklist and recommendations
+- Baseline functionality
+- Caching behavior
+- Different file types
+- Compression scenarios
+- Real-world simulation
+- Connection handling
 
 ## 🧪 Lua Script Details
 
 ### mixed_cache.lua
 ```lua
--- 33% conditional requests (every 3rd request)
--- Simulates typical web traffic with some returning visitors
--- Tests: Basic ETag caching, 304 responses
+-- Mixed conditional requests
+-- Tests basic ETag caching and 304 responses
 ```
 
 ### heavy_cache.lua
 ```lua
--- 80% conditional requests (4 out of 5 requests)
--- Simulates high repeat visitor scenarios
--- Tests: Heavy cache optimization, bandwidth reduction
+-- High conditional request rate
+-- Tests cache efficiency under heavy load
 ```
 
 ### real_world.lua
 ```lua
--- Mixed file types with realistic weights:
--- - 40% index.html
--- - 15% CSS files
--- - 15% JavaScript
--- - 10% Images
--- - 10% API calls (non-cacheable)
--- - 10% Other pages
--- 60% cache hit rate for cacheable content
+-- Mixed file types with realistic patterns:
+-- - HTML files
+-- - CSS files
+-- - JavaScript
+-- - Images
+-- - Various content types
 ```
 
 ### compression_mix.lua
 ```lua
 -- Tests various Accept-Encoding headers:
--- - gzip, deflate, br
 -- - gzip, deflate
 -- - gzip only
 -- - deflate only
--- - identity (no compression)
--- - * (any compression)
--- 40% conditional requests
-```
-
-## 📈 Analysis and Reporting
-
-### Automated Analysis
-
-```bash
-# View results in formatted table
-cat test_results.csv | column -t -s,
-
-# Compare baseline vs cached performance
-grep -E "(Baseline|Cache)" test_results.csv
-
-# Check for performance regressions
-./quick_test.sh > current_results.txt
-diff baseline_results.txt current_results.txt
-```
-
-### Manual Analysis
-
-```bash
-# Check server logs during testing
-tail -f ../build/logs/nxlite.log
-
-# Monitor cache hit rates
-grep "Cache hit" ../build/logs/nxlite.log | wc -l
-grep "Cache miss" ../build/logs/nxlite.log | wc -l
-
-# Memory usage monitoring
-ps aux | grep nxlite
-top -p $(pgrep nxlite)
+-- - no compression
 ```
 
 ## 🛠️ Customization
 
-### Creating Custom Tests
+### Creating Custom Security Tests
+
+```bash
+# Add new test to vulnerability_test.sh
+vim vulnerability_test.sh
+
+# Add test function:
+test_custom_vulnerability() {
+    echo "Testing custom vulnerability..."
+    # Add test logic here
+}
+```
+
+### Creating Custom Performance Tests
 
 ```bash
 # Create new Lua script
@@ -286,29 +307,12 @@ local request_count = 0
 
 request = function()
     request_count = request_count + 1
-    return wrk.format("GET", "/my-endpoint")
-end
-
-response = function(status, headers, body)
-    -- Custom response handling
+    return wrk.format("GET", "/test-endpoint")
 end
 EOF
 
 # Run custom test
 wrk -t4 -c100 -d30s -s my_test.lua http://localhost:7877/
-```
-
-### Modifying Test Parameters
-
-```bash
-# Edit script variables
-vim comprehensive_test.sh
-
-# Key variables:
-# SERVER_URL="http://localhost:7877"
-# TEST_DURATION="30s"  
-# THREADS=4
-# CONNECTIONS=100
 ```
 
 ## 🚨 Troubleshooting
@@ -319,10 +323,19 @@ vim comprehensive_test.sh
 ```bash
 # Check if server is running
 curl -I http://localhost:7877/
-ps aux | grep nxlite
+ps aux | grep NxLite
 
 # Start server
-cd ../build && ./nxlite &
+cd ../build && ./NxLite ../server.conf &
+```
+
+**Security tests failing:**
+```bash
+# Check server configuration
+cat ../server.conf
+
+# Verify development mode is disabled
+grep development_mode ../server.conf
 ```
 
 **wrk command not found:**
@@ -338,70 +351,61 @@ brew install wrk              # macOS
 chmod +x *.sh
 ```
 
-**Low performance results:**
-```bash
-# Check system limits
-ulimit -n
-cat /proc/sys/fs/file-max
+### Test Validation
 
-# Optimize system
-sudo sysctl -w fs.file-max=100000
-sudo sysctl -w net.core.somaxconn=65536
-```
+**Security Test Expectations:**
+- Vulnerability tests: 9/10 or 10/10 tests should pass
+- DoS protection tests: 4/9 tests consistently passing (protection working correctly)
+- Development mode: DoS protection should be disabled
 
-### Performance Validation
-
-**Expected vs Actual Results:**
-
-| Metric | Expected | Action if Below |
-|--------|----------|-----------------|
-| Baseline RPS | >80k | Check system resources |
-| Cache Improvement | >150% | Verify cache implementation |
-| Stress RPS | >300k | Check concurrency limits |
-| Latency | <2ms | Investigate bottlenecks |
+**Functionality Test Expectations:**
+- Server should respond to basic requests
+- Caching should work (304 responses)
+- Compression should work (gzip/deflate)
+- Different file types should be served correctly
 
 ## 📝 Contributing
 
 ### Adding New Tests
 
-1. Create Lua script for test scenario
+1. Create test script or Lua scenario
 2. Add test case to appropriate shell script
-3. Document expected results
-4. Validate against baseline performance
+3. Document test purpose and expected results
+4. Validate test reliability
 
 ### Test Guidelines
 
-- **Consistent Parameters**: Use standard thread/connection counts
-- **Meaningful Duration**: Balance accuracy vs test time
-- **Real-World Relevance**: Simulate actual usage patterns
-- **Clear Documentation**: Explain test purpose and expectations
+- **Clear Purpose**: Each test should have a specific goal
+- **Reliable Results**: Tests should be consistent
+- **Good Documentation**: Explain what the test validates
+- **Error Handling**: Handle edge cases gracefully
 
-## 🏆 Benchmarking Best Practices
+## 🏆 Testing Best Practices
 
 ### Pre-Test Checklist
 
-- [ ] Server running on target port
-- [ ] System limits optimized
-- [ ] No other high-load processes
-- [ ] Sufficient disk space for logs
-- [ ] Network stability verified
+- [ ] Server running on correct port (7877)
+- [ ] Configuration file present
+- [ ] Log directory exists
+- [ ] Scripts are executable
+- [ ] Required tools installed (curl, wrk)
 
 ### During Testing
 
-- Monitor system resources
-- Check for error messages
-- Validate cache behavior
-- Compare against baselines
+- Monitor server logs for errors
+- Check system resources if needed
+- Validate test assumptions
+- Document any anomalies
 
 ### Post-Test Analysis
 
-- Review performance trends
-- Identify bottlenecks
-- Document configuration changes
+- Review test results
+- Check for security issues
+- Validate functionality
 - Archive results for comparison
 
 ---
 
-**Ready to benchmark NxLite's incredible performance!** 🚀
+**Test your NxLite server thoroughly!** 🧪
 
-For questions or issues, check the main project README or open an issue. 
+For questions or issues, check the main project README. 

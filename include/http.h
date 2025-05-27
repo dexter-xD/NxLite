@@ -25,6 +25,8 @@
 #define MAX_HEADER_SIZE 1024
 #define MAX_URI_SIZE 2048
 #define MAX_METHOD_SIZE 16
+#define MAX_REQUEST_SIZE (64 * 1024)
+#define MAX_HEADER_LINE_SIZE 8192
 
 typedef enum {
     COMPRESSION_NONE = 0,

@@ -116,11 +116,32 @@ static int set_resource_limits(void) {
     return 0;
 }
 
+void print_usage(const char *program_name) {
+    printf("Usage: %s [options] [config_file]\n", program_name);
+    printf("Options:\n");
+    printf("  -d, --dev         Enable development mode (disables DoS protection)\n");
+    printf("  -h, --help        Show this help message\n");
+    printf("\nDefault config file: config/server.conf\n");
+}
+
 int main(int argc, char *argv[]) {
     const char *config_file = "config/server.conf";
+    int development_mode = 0;
     
-    if (argc > 1) {
-        config_file = argv[1];
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--dev") == 0) {
+            development_mode = 1;
+            printf("Development mode enabled - DoS protection disabled\n");
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        } else if (argv[i][0] != '-') {
+            config_file = argv[i];
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            print_usage(argv[0]);
+            return 1;
+        }
     }
     
     char abs_config_path[PATH_MAX];
@@ -133,6 +154,10 @@ int main(int argc, char *argv[]) {
     if (config_load(config, abs_config_path) != 0) {
         fprintf(stderr, "Failed to load configuration from %s\n", abs_config_path);
         return 1;
+    }
+    
+    if (development_mode) {
+        config->development_mode = 1;
     }
     
     ensure_directories_exist(config->log_file);
@@ -158,6 +183,11 @@ int main(int argc, char *argv[]) {
     }
     
     LOG_INFO("Starting server on port %d with %d workers", config->port, config->worker_count);
+    
+    if (config->development_mode) {
+        LOG_WARN("DEVELOPMENT MODE ACTIVE - DoS protection disabled!");
+        LOG_WARN("This should NEVER be used in production!");
+    }
     
     master_run(&master);
     

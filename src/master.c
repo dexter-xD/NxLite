@@ -11,9 +11,11 @@ static void handle_child_signal(int signo __attribute__((unused))) {
     while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
         LOG_INFO("Worker process %d exited with status %d", pid, WEXITSTATUS(status));
         
-        if (master_instance && master_instance->is_running) {
-            for (int i = 0; i < master_instance->worker_count; i++) {
-                if (worker_pids[i] == pid) {
+        for (int i = 0; i < master_instance->worker_count; i++) {
+            if (worker_pids[i] == pid) {
+                worker_pids[i] = 0; 
+                
+                if (master_instance && master_instance->is_running && !shutdown_requested && !master_instance->is_shutting_down) {
                     LOG_INFO("Restarting worker %d", i);
                     pid_t new_pid = fork();
                     if (new_pid == 0) {
@@ -29,8 +31,10 @@ static void handle_child_signal(int signo __attribute__((unused))) {
                     } else {
                         LOG_ERROR("Failed to fork worker process: %s", strerror(errno));
                     }
-                    break;
+                } else {
+                    LOG_DEBUG("Worker %d (PID %d) exited during shutdown", i, pid);
                 }
+                break;
             }
         }
     }
@@ -152,6 +156,7 @@ int master_init(master_t *master, int port, int worker_count) {
     master->port = port;
     master->worker_count = worker_count;
     master->is_running = 1;
+    master->is_shutting_down = 0;
     master_instance = master;
 
     master->server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -255,15 +260,21 @@ void master_run(master_t *master) {
     }
 
     LOG_INFO("Master shutting down, sending SIGTERM to workers");
+    
+    master->is_shutting_down = 1;
+    
     for (int i = 0; i < master->worker_count; i++) {
         if (worker_pids[i] > 0) {
             kill(worker_pids[i], SIGTERM);
         }
     }
 
-    int timeout = 5; 
+    int timeout = 10;
     time_t start_time = time(NULL);
     int all_exited = 0;
+    int graceful_exits = 0;
+    
+    LOG_INFO("Waiting up to %d seconds for workers to exit gracefully", timeout);
     
     while (!all_exited && time(NULL) - start_time < timeout) {
         all_exited = 1;
@@ -274,24 +285,37 @@ void master_run(master_t *master) {
                 if (result == 0) {
                     all_exited = 0;
                 } else if (result > 0) {
+                    LOG_DEBUG("Worker %d (PID %d) exited gracefully with status %d", i, worker_pids[i], WEXITSTATUS(status));
                     worker_pids[i] = 0;
-                    LOG_INFO("Worker %d exited with status %d", i, WEXITSTATUS(status));
+                    graceful_exits++;
+                } else if (result == -1 && errno == ECHILD) {
+                    LOG_DEBUG("Worker %d (PID %d) already reaped by SIGCHLD handler", i, worker_pids[i]);
+                    worker_pids[i] = 0;
+                    graceful_exits++;
                 }
             }
         }
         
         if (!all_exited) {
-            usleep(100000); 
+            usleep(200000);
         }
     }
 
+    int forceful_kills = 0;
     for (int i = 0; i < master->worker_count; i++) {
         if (worker_pids[i] > 0) {
+            forceful_kills++;
             LOG_WARN("Worker %d (PID %d) did not exit gracefully, sending SIGKILL", 
                     i, worker_pids[i]);
             kill(worker_pids[i], SIGKILL);
             waitpid(worker_pids[i], NULL, 0);
         }
+    }
+    
+    if (forceful_kills > 0) {
+        LOG_WARN("Had to forcefully terminate %d workers", forceful_kills);
+    } else {
+        LOG_INFO("All workers exited gracefully");
     }
 
     LOG_INFO("Master process exiting");

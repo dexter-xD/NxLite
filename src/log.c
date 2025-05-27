@@ -1,5 +1,17 @@
 #include "log.h"
 
+// Security: Sanitize input for logging to prevent log injection
+static void sanitize_for_log(char *str, size_t max_len) {
+    if (!str) return;
+    
+    size_t len = strnlen(str, max_len);
+    for (size_t i = 0; i < len; i++) {
+        // Replace control characters and non-printable chars
+        if (str[i] < 32 || str[i] > 126) {
+            str[i] = '?';
+        }
+    }
+}
 
 static FILE *log_file = NULL;
 static log_level_t current_level = LOG_INFO;
@@ -86,8 +98,18 @@ void log_access(const char *client_ip, const char *method, const char *uri,
     get_timestamp(timestamp, sizeof(timestamp));
 
     if (log_file != NULL) {
+        // Security: Sanitize inputs to prevent log injection
+        char safe_method[32], safe_uri[512];
+        strncpy(safe_method, method ? method : "-", sizeof(safe_method) - 1);
+        strncpy(safe_uri, uri ? uri : "-", sizeof(safe_uri) - 1);
+        safe_method[sizeof(safe_method) - 1] = '\0';
+        safe_uri[sizeof(safe_uri) - 1] = '\0';
+        
+        sanitize_for_log(safe_method, sizeof(safe_method));
+        sanitize_for_log(safe_uri, sizeof(safe_uri));
+        
         fprintf(log_file, "%s - - [%s] \"%s %s\" %d %ld\n",
-                client_ip, timestamp, method, uri, status, response_size);
+                client_ip ? client_ip : "-", timestamp, safe_method, safe_uri, status, response_size);
         fflush(log_file);
     }
 

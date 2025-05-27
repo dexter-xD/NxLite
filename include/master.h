@@ -31,6 +31,7 @@ typedef struct {
     int port;
     int worker_count;
     int is_running;
+    int is_shutting_down;
 } master_t;
 
 int master_init(master_t *master, int port, int worker_count);

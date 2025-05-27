@@ -14,6 +14,7 @@ void config_init(config_t *config) {
     strncpy(config->log_file, "./logs/access.log", sizeof(config->log_file) - 1);
     config->max_connections = 10000;
     config->keep_alive_timeout = 60;
+    config->development_mode = 0;
 }
 
 static void trim_whitespace(char *str) {
@@ -51,6 +52,8 @@ static int parse_config_line(config_t *config, const char *line) {
         config->max_connections = atoi(value);
     } else if (strcmp(key, "keep_alive_timeout") == 0) {
         config->keep_alive_timeout = atoi(value);
+    } else if (strcmp(key, "development_mode") == 0) {
+        config->development_mode = (strcmp(value, "true") == 0 || strcmp(value, "1") == 0);
     }
 
     return 0;
@@ -86,6 +89,7 @@ int config_reload(config_t *config, const char *filename) {
     strncpy(config->root_dir, new_config.root_dir, sizeof(config->root_dir) - 1);
     strncpy(config->log_file, new_config.log_file, sizeof(config->log_file) - 1);
     config->keep_alive_timeout = new_config.keep_alive_timeout;
+    config->development_mode = new_config.development_mode;
 
     return 0;
 } 

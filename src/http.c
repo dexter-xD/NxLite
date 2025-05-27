@@ -9,6 +9,7 @@ static const struct {
     {400, "Bad Request"},
     {403, "Forbidden"},
     {404, "Not Found"},
+    {413, "Request Entity Too Large"},
     {500, "Internal Server Error"},
     {501, "Not Implemented"},
     {505, "HTTP Version Not Supported"},
@@ -170,19 +171,43 @@ int http_parse_request(const char *buffer, size_t length, http_request_t *reques
     char *line_start = (char *)buffer;
     char *line_end;
     
+    // Security: Check request size limit
+    if (length > MAX_REQUEST_SIZE) {
+        LOG_WARN("Request too large: %zu bytes (max: %d)", length, MAX_REQUEST_SIZE);
+        return -2;  // Oversized request
+    }
+    
     request->keep_alive = 0;
     
     line_end = strstr(line_start, "\r\n");
-    if (!line_end) return -1;
+    if (!line_end) return -1;  // Malformed request
     
     char method[16], uri[2048], version[16];
     if (sscanf(line_start, "%15s %2047s %15s", method, uri, version) != 3) {
-        return -1;
+        return -1;  // Malformed request
+    }
+    
+    // Security: Validate HTTP version
+    if (strcmp(version, "HTTP/1.0") != 0 && strcmp(version, "HTTP/1.1") != 0) {
+        LOG_WARN("Unsupported HTTP version: %s", version);
+        return -3;  // Unsupported version
+    }
+    
+    // Security: Validate method
+    if (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0 && 
+        strcmp(method, "POST") != 0 && strcmp(method, "PUT") != 0 && 
+        strcmp(method, "DELETE") != 0 && strcmp(method, "OPTIONS") != 0 && 
+        strcmp(method, "TRACE") != 0 && strcmp(method, "PATCH") != 0) {
+        LOG_WARN("Invalid HTTP method: %s", method);
+        return -1;  // Malformed request
     }
     
     strncpy(request->method, method, sizeof(request->method) - 1);
+    request->method[sizeof(request->method) - 1] = '\0';
     strncpy(request->uri, uri, sizeof(request->uri) - 1);
+    request->uri[sizeof(request->uri) - 1] = '\0';
     strncpy(request->version, version, sizeof(request->version) - 1);
+    request->version[sizeof(request->version) - 1] = '\0';
     
     line_start = line_end + 2;
     request->header_count = 0;
@@ -193,16 +218,43 @@ int http_parse_request(const char *buffer, size_t length, http_request_t *reques
         
         if (line_end == line_start) break;
         
+        // Security: Check header line size
+        if (line_end - line_start > MAX_HEADER_LINE_SIZE) {
+            LOG_WARN("Header line too long: %ld bytes (max: %d)", line_end - line_start, MAX_HEADER_LINE_SIZE);
+            return -1;  // Malformed request
+        }
+        
         char *colon = strchr(line_start, ':');
         if (colon) {
-            *colon = '\0';
+            size_t name_len = colon - line_start;
             char *value = colon + 1;
             while (*value == ' ') value++;
             
-            strncpy(request->headers[request->header_count][0], line_start, MAX_HEADER_SIZE - 1);
-            strncpy(request->headers[request->header_count][1], value, MAX_HEADER_SIZE - 1);
+            // Security: Check header name length
+            if (name_len >= MAX_HEADER_SIZE) {
+                LOG_WARN("Header name too long: %zu bytes (max: %d)", name_len, MAX_HEADER_SIZE - 1);
+                return -1;  // Malformed request
+            }
             
-            if (strcasecmp(line_start, "Connection") == 0) {
+            // Copy header name without modifying original buffer
+            char header_name[MAX_HEADER_SIZE];
+            strncpy(header_name, line_start, name_len);
+            header_name[name_len] = '\0';
+            
+            // Security: Validate header name (no control characters)
+            for (char *p = header_name; *p; p++) {
+                if (*p < 32 || *p > 126) {
+                    LOG_WARN("Invalid character in header name");
+                    return -1;  // Malformed request
+                }
+            }
+            
+            strncpy(request->headers[request->header_count][0], header_name, MAX_HEADER_SIZE - 1);
+            request->headers[request->header_count][0][MAX_HEADER_SIZE - 1] = '\0';
+            strncpy(request->headers[request->header_count][1], value, MAX_HEADER_SIZE - 1);
+            request->headers[request->header_count][1][MAX_HEADER_SIZE - 1] = '\0';
+            
+            if (strcasecmp(header_name, "Connection") == 0) {
                 LOG_DEBUG("Found Connection header: %s", value);
             }
             
@@ -250,7 +302,14 @@ void http_create_response(http_response_t *response, int status_code) {
     response->compressed_length = 0;
     response->compression_level = COMPRESSION_LEVEL_NONE;
     
-    http_add_header(response, "Server", "NxLite");
+    // Security headers
+    http_add_header(response, "X-Content-Type-Options", "nosniff");
+    http_add_header(response, "X-Frame-Options", "DENY");
+    http_add_header(response, "X-XSS-Protection", "1; mode=block");
+    http_add_header(response, "Referrer-Policy", "strict-origin-when-cross-origin");
+    http_add_header(response, "Content-Security-Policy", "default-src 'self'");
+    
+    // Reduced information disclosure - no server header
 }
 
 void http_add_header(http_response_t *response, const char *name, const char *value) {
@@ -390,11 +449,25 @@ int http_serve_file(const char *path, http_response_t *response, const http_requ
     strftime(last_modified, sizeof(last_modified), "%a, %d %b %Y %H:%M:%S GMT", tm_info);
     http_add_header(response, "Last-Modified", last_modified);
     
+    // Security: Generate more secure ETag using better hash
     char etag[64];
-    snprintf(etag, sizeof(etag), "\"%lx-%lx-%lx\"", 
-             (unsigned long)st.st_ino, 
-             (unsigned long)st.st_size, 
-             (unsigned long)st.st_mtime);
+    char etag_input[PATH_MAX + 128]; // Ensure enough space for path + numbers
+    int written = snprintf(etag_input, sizeof(etag_input), "%s:%lu:%lu:%lu", 
+                          full_path, (unsigned long)st.st_ino, 
+                          (unsigned long)st.st_size, (unsigned long)st.st_mtime);
+    
+    // Truncate if too long (shouldn't happen with our buffer size)
+    if (written >= (int)sizeof(etag_input)) {
+        etag_input[sizeof(etag_input) - 1] = '\0';
+    }
+    
+    // Simple but better hash than just concatenation
+    unsigned long hash = 5381;
+    for (char *p = etag_input; *p; p++) {
+        hash = ((hash << 5) + hash) + *p;
+    }
+    
+    snprintf(etag, sizeof(etag), "\"%lx\"", hash);
     http_add_header(response, "ETag", etag);
     
     http_add_header(response, "Vary", "Accept-Encoding, User-Agent");
@@ -943,11 +1016,25 @@ void http_handle_request(const http_request_t *request, http_response_t *respons
         }
     }
 
+    // Security: Generate more secure ETag using better hash
     char etag[64];
-    snprintf(etag, sizeof(etag), "\"%lx-%lx-%lx\"", 
-             (unsigned long)st.st_ino, 
-             (unsigned long)st.st_size, 
-             (unsigned long)st.st_mtime);
+    char etag_input[PATH_MAX + 128]; // Ensure enough space for path + numbers
+    int written = snprintf(etag_input, sizeof(etag_input), "%s:%lu:%lu:%lu", 
+                          file_path, (unsigned long)st.st_ino, 
+                          (unsigned long)st.st_size, (unsigned long)st.st_mtime);
+    
+    // Truncate if too long (shouldn't happen with our buffer size)
+    if (written >= (int)sizeof(etag_input)) {
+        etag_input[sizeof(etag_input) - 1] = '\0';
+    }
+    
+    // Simple but better hash than just concatenation
+    unsigned long hash = 5381;
+    for (char *p = etag_input; *p; p++) {
+        hash = ((hash << 5) + hash) + *p;
+    }
+    
+    snprintf(etag, sizeof(etag), "\"%lx\"", hash);
 
     if (if_none_match) {
         LOG_DEBUG("Checking ETag: client sent '%s', server has '%s'", if_none_match, etag);

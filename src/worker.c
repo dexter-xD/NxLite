@@ -2,6 +2,155 @@
 
 extern void setup_signal_handlers(void);
 
+static volatile sig_atomic_t worker_shutdown_requested = 0;
+
+static void worker_signal_handler(int signo) {
+    switch (signo) {
+        case SIGTERM:
+        case SIGINT:
+            worker_shutdown_requested = 1;
+            shutdown_requested = 1;
+            break;
+        case SIGHUP:
+            break;
+        default:
+            break;
+    }
+}
+
+static rate_limit_entry_t rate_limit_table[RATE_LIMIT_TABLE_SIZE];
+static pthread_mutex_t rate_limit_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static unsigned int hash_ip(const char *ip) {
+    unsigned int hash = 5381;
+    int c;
+    while ((c = *ip++)) {
+        hash = ((hash << 5) + hash) + c;
+    }
+    return hash % RATE_LIMIT_TABLE_SIZE;
+}
+
+static int check_rate_limit(const char *client_ip) {
+    if (!client_ip) return 0;
+    
+    config_t *config = config_get_instance();
+    if (config->development_mode) {
+        return 1;
+    }
+    
+    pthread_mutex_lock(&rate_limit_mutex);
+    
+    unsigned int hash = hash_ip(client_ip);
+    rate_limit_entry_t *entry = &rate_limit_table[hash];
+    time_t now = time(NULL);
+    
+    if (entry->ban_until > 0 && now < entry->ban_until) {
+        pthread_mutex_unlock(&rate_limit_mutex);
+        LOG_WARN("Banned IP %s attempted connection (ban expires in %ld seconds)", 
+                 client_ip, entry->ban_until - now);
+        return 0;
+    }
+    
+    if (entry->ban_until > 0 && now >= entry->ban_until) {
+        entry->ban_until = 0;
+        entry->violation_count = 0;
+        LOG_INFO("Ban expired for IP %s", client_ip);
+    }
+    
+    if (entry->ip[0] == '\0' || strcmp(entry->ip, client_ip) != 0 || 
+        (now - entry->window_start) > RATE_LIMIT_WINDOW * 2) {
+        strncpy(entry->ip, client_ip, sizeof(entry->ip) - 1);
+        entry->ip[sizeof(entry->ip) - 1] = '\0';
+        entry->window_start = now;
+        entry->request_count = 1;
+        entry->last_request = now;
+        entry->connection_count = 1;
+        pthread_mutex_unlock(&rate_limit_mutex);
+        return 1;
+    }
+    
+    if (entry->connection_count >= MAX_CONCURRENT_CONNECTIONS_PER_IP) {
+        pthread_mutex_unlock(&rate_limit_mutex);
+        LOG_WARN("Too many concurrent connections from IP %s: %d", 
+                 client_ip, entry->connection_count);
+        return 0;
+    }
+    
+    if ((now - entry->window_start) >= RATE_LIMIT_WINDOW) {
+        entry->window_start = now;
+        entry->request_count = 1;
+        entry->last_request = now;
+        entry->connection_count++;
+        pthread_mutex_unlock(&rate_limit_mutex);
+        return 1;
+    }
+    
+    entry->request_count++;
+    entry->last_request = now;
+    entry->connection_count++;
+    
+    if (entry->request_count > RATE_LIMIT_MAX_REQUESTS) {
+        entry->violation_count++;
+        
+        if (entry->violation_count >= MAX_VIOLATIONS_BEFORE_BAN) {
+            entry->ban_until = now + BAN_DURATION;
+            LOG_WARN("IP %s banned for %d seconds after %d violations", 
+                     client_ip, BAN_DURATION, entry->violation_count);
+        }
+        
+        pthread_mutex_unlock(&rate_limit_mutex);
+        LOG_WARN("Rate limit exceeded for IP %s: %d requests in window (violation #%d)", 
+                 client_ip, entry->request_count, entry->violation_count);
+        return 0;
+    }
+    
+    pthread_mutex_unlock(&rate_limit_mutex);
+    return 1;
+}
+
+static void decrement_connection_count(const char *client_ip) {
+    if (!client_ip) return;
+    
+    pthread_mutex_lock(&rate_limit_mutex);
+    
+    unsigned int hash = hash_ip(client_ip);
+    rate_limit_entry_t *entry = &rate_limit_table[hash];
+    
+    if (entry->ip[0] != '\0' && strcmp(entry->ip, client_ip) == 0) {
+        if (entry->connection_count > 0) {
+            entry->connection_count--;
+            LOG_DEBUG("Decremented connection count for IP %s: %d", 
+                      client_ip, entry->connection_count);
+        }
+    }
+    
+    pthread_mutex_unlock(&rate_limit_mutex);
+}
+
+static void cleanup_rate_limit_table(void) {
+    pthread_mutex_lock(&rate_limit_mutex);
+    
+    time_t now = time(NULL);
+    int cleaned = 0;
+    
+    for (int i = 0; i < RATE_LIMIT_TABLE_SIZE; i++) {
+        rate_limit_entry_t *entry = &rate_limit_table[i];
+        
+        if (entry->ip[0] != '\0' && 
+            entry->ban_until == 0 && 
+            (now - entry->last_request) > (RATE_LIMIT_WINDOW * 4)) {
+            memset(entry, 0, sizeof(rate_limit_entry_t));
+            cleaned++;
+        }
+    }
+    
+    if (cleaned > 0) {
+        LOG_DEBUG("Cleaned %d old rate limit entries", cleaned);
+    }
+    
+    pthread_mutex_unlock(&rate_limit_mutex);
+}
+
 
 static int set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
@@ -68,6 +217,31 @@ static int remove_from_epoll(worker_t *worker, int fd) {
 
 int worker_init(worker_t *worker, int server_fd, int cpu_id) {
     memset(worker, 0, sizeof(worker_t));
+    
+    worker_shutdown_requested = 0;
+    
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = worker_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    
+    if (sigaction(SIGTERM, &sa, NULL) == -1) {
+        LOG_ERROR("Failed to set SIGTERM handler: %s", strerror(errno));
+        return -1;
+    }
+    
+    if (sigaction(SIGINT, &sa, NULL) == -1) {
+        LOG_ERROR("Failed to set SIGINT handler: %s", strerror(errno));
+        return -1;
+    }
+    
+    if (sigaction(SIGHUP, &sa, NULL) == -1) {
+        LOG_ERROR("Failed to set SIGHUP handler: %s", strerror(errno));
+        return -1;
+    }
+    
+    signal(SIGPIPE, SIG_IGN);
     
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
@@ -227,6 +401,8 @@ void worker_remove_client(worker_t *worker, int client_fd) {
             remove_from_epoll(worker, client_fd);
             remove_from_epoll(worker, worker->clients[i].timer_fd);
             
+            decrement_connection_count(worker->clients[i].client_ip);
+            
             if (worker->clients[i].buffer) {
                 mempool_free(&worker->buffer_pool, worker->clients[i].buffer);
                 LOG_DEBUG("Buffer freed for fd=%d", client_fd);
@@ -256,8 +432,20 @@ void worker_handle_timeout(worker_t *worker, int timer_fd) {
     for (int i = 0; i < worker->client_count; i++) {
         if (worker->clients[i].timer_fd == timer_fd) {
             time_t now = time(NULL);
+            
+            if (worker->clients[i].bytes_received > 0 && 
+                worker->clients[i].bytes_received < 4 &&
+                (now - worker->clients[i].connection_start) >= SLOW_LORIS_TIMEOUT) {
+                LOG_WARN("Slow loris attack detected from %s: incomplete request after %ld seconds", 
+                         worker->clients[i].client_ip, now - worker->clients[i].connection_start);
+                worker_remove_client(worker, worker->clients[i].fd);
+                break;
+            }
+            
             if (now - worker->clients[i].last_activity >= worker->keep_alive_timeout) {
-                LOG_INFO("Client timeout: fd=%d, idle=%lds", worker->clients[i].fd, now - worker->clients[i].last_activity);
+                LOG_INFO("Client timeout: fd=%d, ip=%s, idle=%lds", 
+                         worker->clients[i].fd, worker->clients[i].client_ip,
+                         now - worker->clients[i].last_activity);
                 worker_remove_client(worker, worker->clients[i].fd);
             }
             break;
@@ -363,19 +551,30 @@ void worker_handle_connection(worker_t *worker, int client_fd) {
         return;
     }
     
+    time_t now = time(NULL);
     worker->clients[worker->client_count].fd = client_fd;
     worker->clients[worker->client_count].timer_fd = timer_fd;
-    worker->clients[worker->client_count].last_activity = time(NULL);
+    worker->clients[worker->client_count].last_activity = now;
     worker->clients[worker->client_count].buffer = buffer;
-    worker->clients[worker->client_count].keep_alive = 1;  // Default to keep-alive
+    worker->clients[worker->client_count].keep_alive = 1;
     worker->clients[worker->client_count].has_pending_response = 0;
-    worker->client_count++;
+    worker->clients[worker->client_count].connection_start = now;
+    worker->clients[worker->client_count].bytes_received = 0;
     
     struct sockaddr_in client_addr;
     socklen_t addr_len = sizeof(client_addr);
     if (getpeername(client_fd, (struct sockaddr*)&client_addr, &addr_len) == 0) {
-        LOG_INFO("Accepted connection: fd=%d, ip=%s, port=%d, clients=%d", client_fd, inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port), worker->client_count);
+        inet_ntop(AF_INET, &client_addr.sin_addr, 
+                  worker->clients[worker->client_count].client_ip, 
+                  INET_ADDRSTRLEN);
+        LOG_INFO("Accepted connection: fd=%d, ip=%s, port=%d, clients=%d", 
+                 client_fd, worker->clients[worker->client_count].client_ip, 
+                 ntohs(client_addr.sin_port), worker->client_count + 1);
+    } else {
+        strcpy(worker->clients[worker->client_count].client_ip, "unknown");
     }
+    
+    worker->client_count++;
     
     LOG_DEBUG("Buffer allocated for fd=%d", client_fd);
 }
@@ -398,8 +597,21 @@ void worker_handle_client_data(worker_t *worker, int client_fd) {
 
     while ((bytes_read = recv(client_fd, client->buffer + total_read, BUFFER_SIZE - total_read - 1, 0)) > 0) {
         total_read += bytes_read;
+        client->bytes_received += bytes_read;
+        
         if ((size_t)total_read >= BUFFER_SIZE - 1) {
+            LOG_WARN("Request too large from %s: %d bytes", client->client_ip, total_read);
             break;
+        }
+        
+        if (bytes_read == 1 && client->bytes_received > 100) {
+            time_t now = time(NULL);
+            if ((now - client->connection_start) > 5) {
+                LOG_WARN("Potential slow loris attack from %s: %d single-byte reads", 
+                         client->client_ip, client->bytes_received);
+                worker_remove_client(worker, client_fd);
+                return;
+            }
         }
     }
 
@@ -420,12 +632,27 @@ void worker_handle_client_data(worker_t *worker, int client_fd) {
             int req_len = end - (client->buffer + offset) + 4;
             
             http_request_t request;
-            if (http_parse_request(client->buffer + offset, req_len, &request) != 0) {
-                LOG_ERROR("Failed to parse HTTP request from fd=%d", client_fd);
+            int parse_result = http_parse_request(client->buffer + offset, req_len, &request);
+            if (parse_result != 0) {
                 http_response_t response;
-                http_create_response(&response, 400);
-                response.keep_alive = 0;  // Force close on error
+                
+                if (parse_result == -2) {
+                    // Request too large
+                    LOG_WARN("Request too large from %s (fd=%d)", client->client_ip, client_fd);
+                    http_create_response(&response, 413);
+                } else if (parse_result == -3) {
+                    // Unsupported HTTP version
+                    LOG_WARN("Unsupported HTTP version from %s (fd=%d)", client->client_ip, client_fd);
+                    http_create_response(&response, 505);
+                } else {
+                    // Malformed request
+                    LOG_WARN("Malformed HTTP request from %s (fd=%d)", client->client_ip, client_fd);
+                    http_create_response(&response, 400);
+                }
+                
+                response.keep_alive = 0;
                 http_send_response(client_fd, &response);
+                http_free_response(&response);
                 worker_remove_client(worker, client_fd);
                 return;
             }
@@ -544,7 +771,7 @@ void worker_handle_client_write(worker_t *worker, int client_fd) {
 }
 
 void worker_run(worker_t *worker) {
-    LOG_INFO("Worker %d starting event loop on CPU %d", worker->cpu_id, worker->cpu_id);
+    LOG_INFO("Worker %d starting event loop on CPU %d (PID %d)", worker->cpu_id, worker->cpu_id, getpid());
     
     int max_accept_per_cycle = 2000;  
     int idle_cycles = 0;
@@ -563,14 +790,26 @@ void worker_run(worker_t *worker) {
         return;
     }
     
-    while (worker->is_running && !shutdown_requested) {
-        int timeout = 5; 
+    LOG_INFO("Worker %d entering main loop: is_running=%d, shutdown_requested=%d, worker_shutdown_requested=%d", 
+             worker->cpu_id, worker->is_running, shutdown_requested, worker_shutdown_requested);
+    
+    int loop_count = 0;
+    
+    while (worker->is_running && !shutdown_requested && !worker_shutdown_requested) {
+        loop_count++;
+        if (loop_count == 1) {
+            LOG_INFO("Worker %d completed first loop iteration", worker->cpu_id);
+        }
+        if (shutdown_requested || worker_shutdown_requested) {
+            break;
+        }
+        
+        int timeout = 1000;
         int nfds = epoll_wait(worker->epoll_fd, events, MAX_EVENTS * 2, timeout);
         
         if (nfds == -1) {
             if (errno == EINTR) {
-                if (shutdown_requested) {
-                    LOG_INFO("Worker %d received shutdown signal", worker->cpu_id);
+                if (shutdown_requested || worker_shutdown_requested) {
                     break;
                 }
                 continue;
@@ -581,6 +820,10 @@ void worker_run(worker_t *worker) {
         }
         
         if (nfds == 0) {
+            if (shutdown_requested || worker_shutdown_requested) {
+                break;
+            }
+            
             idle_cycles++;
             if (idle_cycles >= max_idle_cycles) {
                 if (idle_cycles < 20) {
@@ -595,6 +838,10 @@ void worker_run(worker_t *worker) {
         }
         
         idle_cycles = 0;
+        
+        if (shutdown_requested || worker_shutdown_requested) {
+            break;
+        }
         
         for (int i = 0; i < nfds; i++) {
             int fd = events[i].data.fd;
@@ -650,6 +897,16 @@ void worker_run(worker_t *worker) {
                         }
                     }
                     
+                    char client_ip[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+                    
+                    if (!check_rate_limit(client_ip)) {
+                        LOG_WARN("Rate limit exceeded, rejecting connection from %s", client_ip);
+                        close(client_fd);
+                        accepted++;
+                        continue;
+                    }
+                    
                     optimize_tcp_socket(client_fd);
                     
                     worker_handle_connection(worker, client_fd);
@@ -680,11 +937,32 @@ void worker_run(worker_t *worker) {
                      worker->cpu_id, requests_per_sec, connection_count, worker->client_count);
             request_count = 0;
             last_stats_time = now;
+            
+            cleanup_rate_limit_table();
+        }
+    }
+    
+    LOG_INFO("Worker %d shutting down gracefully, closing %d client connections", 
+             worker->cpu_id, worker->client_count);
+    
+    for (int i = 0; i < worker->client_count; i++) {
+        if (worker->clients[i].fd > 0) {
+            shutdown(worker->clients[i].fd, SHUT_RDWR);
+            close(worker->clients[i].fd);
+        }
+        if (worker->clients[i].timer_fd > 0) {
+            close(worker->clients[i].timer_fd);
+        }
+        if (worker->clients[i].buffer) {
+            mempool_free(&worker->buffer_pool, worker->clients[i].buffer);
+        }
+        if (worker->clients[i].has_pending_response) {
+            http_free_response(&worker->clients[i].pending_response);
         }
     }
     
     free(events);
-    LOG_INFO("Worker %d exiting event loop", worker->cpu_id);
+    LOG_DEBUG("Worker %d exiting after %d iterations", worker->cpu_id, loop_count);
 }
 
 void worker_cleanup(worker_t *worker) {
